@@ -1,0 +1,59 @@
+[package]
+name = "sentinel-agent-auth"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Sentinel Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/raskell-io/sentinel-agent-auth"
+homepage = "https://sentinel.raskell.io"
+documentation = "https://sentinel.raskell.io/docs/agents/auth"
+description = "Authentication agent for Sentinel reverse proxy - JWT, API keys, and Basic auth"
+keywords = ["proxy", "reverse-proxy", "agent", "authentication", "jwt"]
+categories = ["network-programming", "authentication"]
+readme = "README.md"
+
+[[bin]]
+name = "sentinel-auth-agent"
+path = "src/main.rs"
+
+[dependencies]
+# Sentinel protocol
+sentinel-agent-protocol = "0.1"
+sentinel-common = "0.1"
+
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+
+# JWT
+jsonwebtoken = "9"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Encoding
+base64 = "0.22"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Command line
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# HTTP server
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+
+[dev-dependencies]
+tempfile = "3.12"

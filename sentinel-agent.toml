@@ -1,0 +1,24 @@
+# Sentinel Agent Registry Manifest
+# Auth Agent - JWT, API key, and Basic authentication
+
+[agent]
+name = "sentinel-agent-auth"
+version = "0.1.0"
+description = "Authentication agent for Sentinel reverse proxy - JWT, API keys, and Basic auth"
+authors = ["Sentinel Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/raskell-io/sentinel-agent-auth"
+
+[protocol]
+version = "0.1"
+events = ["request_headers"]
+
+[compatibility]
+sentinel-proxy = ">=0.1.0"
+sentinel-agent-protocol = "0.1"
+
+[registry]
+homepage = "https://sentinel.raskell.io/agents/auth"
+documentation = "https://sentinel.raskell.io/docs/agents/auth"
+keywords = ["sentinel", "agent", "authentication", "jwt", "api-key"]
+categories = ["authentication", "security"]
