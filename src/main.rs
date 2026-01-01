@@ -13,9 +13,10 @@ use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
 use sentinel_agent_protocol::{
-    AgentHandler, AgentResponse, AgentServer, AuditMetadata, HeaderOp,
+    AgentHandler, AgentResponse, AgentServer, AuditMetadata, ConfigureEvent, HeaderOp,
     RequestHeadersEvent, ResponseHeadersEvent,
 };
+use std::sync::RwLock;
 
 /// Command line arguments
 #[derive(Parser, Debug)]
@@ -145,6 +146,35 @@ pub struct AuthConfig {
     pub fail_open: bool,
 }
 
+/// JSON configuration for dynamic reconfiguration via on_configure()
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct AuthConfigJson {
+    /// JWT secret key (for HS256)
+    pub jwt_secret: Option<String>,
+    /// JWT algorithm (HS256, RS256, ES256)
+    pub jwt_algorithm: Option<String>,
+    /// JWT issuer to validate
+    pub jwt_issuer: Option<String>,
+    /// JWT audience to validate
+    pub jwt_audience: Option<String>,
+    /// API keys as key:name pairs
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    /// API key header name
+    pub api_key_header: Option<String>,
+    /// Basic auth users as user:pass pairs
+    #[serde(default)]
+    pub basic_auth_users: Vec<String>,
+    /// Header to add with user ID
+    pub user_id_header: Option<String>,
+    /// Header to add with auth method
+    pub auth_method_header: Option<String>,
+    /// Fail open (allow on auth error)
+    #[serde(default)]
+    pub fail_open: bool,
+}
+
 impl AuthConfig {
     fn from_args(args: &Args) -> Result<Self> {
         // Parse JWT algorithm
@@ -224,16 +254,103 @@ impl AuthConfig {
 
 /// Authentication agent
 pub struct AuthAgent {
-    config: AuthConfig,
+    config: RwLock<AuthConfig>,
 }
 
 impl AuthAgent {
     pub fn new(config: AuthConfig) -> Self {
-        Self { config }
+        Self {
+            config: RwLock::new(config),
+        }
+    }
+
+    /// Reconfigure the agent with new settings
+    pub fn reconfigure(&self, json_config: AuthConfigJson) -> Result<()> {
+        let mut config = self.config.write().map_err(|_| anyhow!("Failed to acquire write lock"))?;
+
+        // Update JWT secret
+        if let Some(secret) = json_config.jwt_secret {
+            config.jwt_secret = Some(secret.as_bytes().to_vec());
+        }
+
+        // Update JWT algorithm
+        if let Some(alg) = json_config.jwt_algorithm {
+            config.jwt_algorithm = match alg.to_uppercase().as_str() {
+                "HS256" => Algorithm::HS256,
+                "HS384" => Algorithm::HS384,
+                "HS512" => Algorithm::HS512,
+                "RS256" => Algorithm::RS256,
+                "RS384" => Algorithm::RS384,
+                "RS512" => Algorithm::RS512,
+                "ES256" => Algorithm::ES256,
+                "ES384" => Algorithm::ES384,
+                _ => return Err(anyhow!("Unsupported JWT algorithm: {}", alg)),
+            };
+        }
+
+        // Update JWT issuer/audience
+        if let Some(issuer) = json_config.jwt_issuer {
+            config.jwt_issuer = Some(issuer);
+        }
+        if let Some(audience) = json_config.jwt_audience {
+            config.jwt_audience = Some(audience);
+        }
+
+        // Update API keys
+        if !json_config.api_keys.is_empty() {
+            config.api_keys.clear();
+            for pair in json_config.api_keys {
+                if let Some((key, name)) = pair.split_once(':') {
+                    config.api_keys.insert(
+                        key.trim().to_string(),
+                        ApiKeyInfo {
+                            key: key.trim().to_string(),
+                            name: name.trim().to_string(),
+                        },
+                    );
+                }
+            }
+        }
+
+        // Update API key header
+        if let Some(header) = json_config.api_key_header {
+            config.api_key_header = header;
+        }
+
+        // Update basic auth users
+        if !json_config.basic_auth_users.is_empty() {
+            config.basic_auth_users.clear();
+            for pair in json_config.basic_auth_users {
+                if let Some((user, pass)) = pair.split_once(':') {
+                    config.basic_auth_users.insert(
+                        user.trim().to_string(),
+                        BasicAuthUser {
+                            username: user.trim().to_string(),
+                            password_hash: pass.trim().to_string(),
+                        },
+                    );
+                }
+            }
+        }
+
+        // Update headers
+        if let Some(header) = json_config.user_id_header {
+            config.user_id_header = header;
+        }
+        if let Some(header) = json_config.auth_method_header {
+            config.auth_method_header = header;
+        }
+
+        // Update fail_open
+        config.fail_open = json_config.fail_open;
+
+        info!("Reconfigured auth agent");
+        Ok(())
     }
 
     /// Authenticate a request
     pub fn authenticate(&self, headers: &HashMap<String, Vec<String>>) -> Result<Identity> {
+        let config = self.config.read().map_err(|_| anyhow!("Failed to acquire read lock"))?;
         // Helper to get first header value (case-insensitive)
         let get_header = |name: &str| -> Option<&str> {
             let name_lower = name.to_lowercase();
@@ -249,7 +366,7 @@ impl AuthAgent {
         if let Some(auth_header) = get_header("authorization") {
             if auth_header.starts_with("Bearer ") || auth_header.starts_with("bearer ") {
                 let token = &auth_header[7..];
-                if let Ok(identity) = self.validate_jwt(token) {
+                if let Ok(identity) = Self::validate_jwt(&config, token) {
                     return Ok(identity);
                 }
             }
@@ -257,15 +374,15 @@ impl AuthAgent {
             // 2. Try Basic auth
             if auth_header.starts_with("Basic ") || auth_header.starts_with("basic ") {
                 let credentials = &auth_header[6..];
-                if let Ok(identity) = self.validate_basic_auth(credentials) {
+                if let Ok(identity) = Self::validate_basic_auth(&config, credentials) {
                     return Ok(identity);
                 }
             }
         }
 
         // 3. Try API key
-        if let Some(api_key) = get_header(&self.config.api_key_header) {
-            if let Ok(identity) = self.validate_api_key(api_key) {
+        if let Some(api_key) = get_header(&config.api_key_header) {
+            if let Ok(identity) = Self::validate_api_key(&config, api_key) {
                 return Ok(identity);
             }
         }
@@ -274,26 +391,26 @@ impl AuthAgent {
     }
 
     /// Validate JWT token
-    fn validate_jwt(&self, token: &str) -> Result<Identity> {
-        let decoding_key = if let Some(ref secret) = self.config.jwt_secret {
+    fn validate_jwt(config: &AuthConfig, token: &str) -> Result<Identity> {
+        let decoding_key = if let Some(ref secret) = config.jwt_secret {
             DecodingKey::from_secret(secret)
-        } else if let Some(ref key) = self.config.jwt_public_key {
+        } else if let Some(ref key) = config.jwt_public_key {
             key.clone()
         } else {
             return Err(anyhow!("No JWT secret or public key configured"));
         };
 
-        let mut validation = Validation::new(self.config.jwt_algorithm);
+        let mut validation = Validation::new(config.jwt_algorithm);
 
         // Set issuer validation
-        if let Some(ref issuer) = self.config.jwt_issuer {
+        if let Some(ref issuer) = config.jwt_issuer {
             validation.set_issuer(&[issuer]);
         } else {
             validation.iss = None;
         }
 
         // Set audience validation
-        if let Some(ref audience) = self.config.jwt_audience {
+        if let Some(ref audience) = config.jwt_audience {
             validation.set_audience(&[audience]);
         } else {
             validation.aud = None;
@@ -324,7 +441,7 @@ impl AuthAgent {
     }
 
     /// Validate Basic auth credentials
-    fn validate_basic_auth(&self, credentials: &str) -> Result<Identity> {
+    fn validate_basic_auth(config: &AuthConfig, credentials: &str) -> Result<Identity> {
         let decoded = BASE64.decode(credentials)
             .context("Invalid base64 in Basic auth")?;
         let auth_str = String::from_utf8(decoded)
@@ -334,7 +451,7 @@ impl AuthAgent {
             .split_once(':')
             .ok_or_else(|| anyhow!("Invalid Basic auth format"))?;
 
-        let user = self.config.basic_auth_users
+        let user = config.basic_auth_users
             .get(username)
             .ok_or_else(|| anyhow!("User not found"))?;
 
@@ -353,8 +470,8 @@ impl AuthAgent {
     }
 
     /// Validate API key
-    fn validate_api_key(&self, api_key: &str) -> Result<Identity> {
-        let key_info = self.config.api_keys
+    fn validate_api_key(config: &AuthConfig, api_key: &str) -> Result<Identity> {
+        let key_info = config.api_keys
             .get(api_key)
             .ok_or_else(|| anyhow!("Invalid API key"))?;
 
@@ -370,7 +487,41 @@ impl AuthAgent {
 
 #[async_trait::async_trait]
 impl AgentHandler for AuthAgent {
+    async fn on_configure(&self, event: ConfigureEvent) -> AgentResponse {
+        let json_config: AuthConfigJson = match serde_json::from_value(event.config) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                warn!("Failed to parse auth config: {}, using defaults", e);
+                return AgentResponse::default_allow();
+            }
+        };
+
+        if let Err(e) = self.reconfigure(json_config) {
+            warn!("Failed to reconfigure auth agent: {}", e);
+            return AgentResponse::block(500, Some(format!("Configuration error: {}", e)));
+        }
+
+        info!("Auth agent configured via on_configure");
+        AgentResponse::default_allow()
+    }
+
     async fn on_request_headers(&self, event: RequestHeadersEvent) -> AgentResponse {
+        // Get config values we need before authentication
+        let (user_id_header, auth_method_header, fail_open) = {
+            let config = match self.config.read() {
+                Ok(c) => c,
+                Err(_) => {
+                    warn!("Failed to acquire config lock");
+                    return AgentResponse::block(500, Some("Internal error".to_string()));
+                }
+            };
+            (
+                config.user_id_header.clone(),
+                config.auth_method_header.clone(),
+                config.fail_open,
+            )
+        };
+
         match self.authenticate(&event.headers) {
             Ok(identity) => {
                 info!(
@@ -381,11 +532,11 @@ impl AgentHandler for AuthAgent {
 
                 let mut response = AgentResponse::default_allow()
                     .add_request_header(HeaderOp::Set {
-                        name: self.config.user_id_header.clone(),
+                        name: user_id_header,
                         value: identity.id.clone(),
                     })
                     .add_request_header(HeaderOp::Set {
-                        name: self.config.auth_method_header.clone(),
+                        name: auth_method_header,
                         value: identity.method.to_string(),
                     });
 
@@ -407,7 +558,7 @@ impl AgentHandler for AuthAgent {
             Err(e) => {
                 debug!("Authentication failed: {}", e);
 
-                if self.config.fail_open {
+                if fail_open {
                     warn!("Authentication failed but fail_open is enabled, allowing request");
                     AgentResponse::default_allow()
                         .with_audit(AuditMetadata {
