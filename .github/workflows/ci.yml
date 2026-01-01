@@ -1,41 +1,56 @@
 name: CI
 
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+# Disabled to conserve GitHub Actions minutes
+# Uncomment triggers below to enable
+# on:
+#   push:
+#     branches: [main]
+#   pull_request:
+#     branches: [main]
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
+on:
+  workflow_dispatch:  # Manual trigger only
 
 jobs:
-  build:
+  check:
+    name: Check
     runs-on: ubuntu-latest
+    if: false  # Disabled - change to true to enable
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-features
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    if: false  # Disabled - change to true to enable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    if: false  # Disabled - change to true to enable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          components: rustfmt
+      - run: cargo fmt --all --check
 
-      - name: Build
-        run: cargo build --release
-
-      - name: Run tests
-        run: cargo test
-
-      - name: Check formatting
-        run: cargo fmt -- --check
-
-      - name: Run clippy
-        run: cargo clippy -- -D warnings
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    if: false  # Disabled - change to true to enable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-features -- -D warnings
