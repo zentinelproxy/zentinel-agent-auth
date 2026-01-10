@@ -55,5 +55,26 @@ axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 
+# SAML authentication (xmlsec feature requires system libxmlsec1)
+samael = "0.0.19"
+
+# Session storage (embedded KV store)
+redb = "2.0"
+rmp-serde = "1.1"
+
+# Cookie handling
+cookie = "0.18"
+
+# Session ID generation
+rand = "0.8"
+hex = "0.4"
+uuid = { version = "1.0", features = ["v4"] }
+
+# SAML deflate compression
+flate2 = "1.0"
+
+# URL encoding
+urlencoding = "2.1"
+
 [dev-dependencies]
 tempfile = "3.12"
