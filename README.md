@@ -1,21 +1,37 @@
 # sentinel-agent-auth
 
-Authentication agent for [Sentinel](https://github.com/raskell-io/sentinel) reverse proxy. Supports JWT/Bearer tokens, API keys, Basic authentication, and SAML SSO.
+Authentication and authorization agent for [Sentinel](https://github.com/raskell-io/sentinel) reverse proxy. Supports JWT/Bearer tokens, OIDC/OAuth 2.0, API keys, Basic authentication, SAML SSO, and mTLS client certificates.
 
 ## Features
 
+### Authentication (AuthN)
 - **JWT/Bearer tokens** - HS256, RS256, ES256 and other algorithms
+- **OIDC/OAuth 2.0** - OpenID Connect with automatic JWKS key rotation
 - **API keys** - Simple header-based authentication
 - **Basic auth** - Username/password authentication
 - **SAML SSO** - Enterprise single sign-on with session persistence
+- **mTLS Client Certificates** - X.509 certificate-based authentication
+
+### Authorization (AuthZ)
+- **Cedar Policy Engine** - Policy-as-code authorization with fine-grained access control
+
+### Token Services
+- **Token Exchange (RFC 8693)** - Convert between token types (SAML to JWT, external to internal JWT)
+
+### General
 - Configurable user ID and auth method headers
 - Fail-open mode for graceful degradation
+- Comprehensive audit logging
 
 ## Documentation
 
 - [Configuration Reference](docs/configuration.md) - Complete configuration options
 - [SAML Authentication](docs/saml.md) - SAML SSO setup and IdP integration
 - [Session Management](docs/session-management.md) - Session persistence and lifecycle
+- [OIDC Authentication](docs/oidc.md) - OIDC/OAuth 2.0 with JWKS
+- [mTLS Authentication](docs/mtls.md) - Client certificate authentication
+- [Authorization](docs/authorization.md) - Cedar policy engine guide
+- [Token Exchange](docs/token-exchange.md) - RFC 8693 token exchange
 
 ## Installation
 
@@ -58,6 +74,8 @@ sentinel-auth-agent --socket /var/run/sentinel/auth.sock \
 | `--auth-method-header` | `AUTH_METHOD_HEADER` | Header for auth method | `X-Auth-Method` |
 | `--fail-open` | `FAIL_OPEN` | Allow on auth failure | `false` |
 | `--verbose` | `AUTH_VERBOSE` | Enable debug logging | `false` |
+
+See [Configuration Reference](docs/configuration.md) for OIDC, mTLS, Cedar authorization, and token exchange options.
 
 ## Authentication Methods
 
@@ -106,6 +124,79 @@ Client request:
 curl -u "admin:secretpass" http://localhost:8080/api
 ```
 
+### OIDC/OAuth 2.0
+
+Configure OIDC with automatic JWKS key fetching and refresh:
+
+```kdl
+config {
+    oidc {
+        enabled true
+        issuer "https://auth.example.com"
+        jwks-url "https://auth.example.com/.well-known/jwks.json"
+        audience "my-api"
+        required-scopes "read,write"
+    }
+}
+```
+
+Client request:
+```bash
+curl -H "Authorization: Bearer <oauth2-access-token>" http://localhost:8080/api
+```
+
+### mTLS Client Certificates
+
+Authenticate clients using X.509 certificates (requires Sentinel proxy to forward client cert):
+
+```kdl
+config {
+    mtls {
+        enabled true
+        client-cert-header "X-Client-Cert"
+        allowed-dns "CN=service.example.com,O=Example"
+        extract-cn-as-user true
+    }
+}
+```
+
+The Sentinel proxy forwards the client certificate in a header after TLS termination.
+
+## Authorization
+
+After authentication, requests can be authorized using Cedar policies:
+
+```kdl
+config {
+    authz {
+        enabled true
+        policy-file "/etc/sentinel/policies/auth.cedar"
+        default-decision "deny"
+    }
+}
+```
+
+Example Cedar policy:
+```cedar
+permit(
+    principal,
+    action == Action::"GET",
+    resource
+) when {
+    resource.path like "/api/public/*"
+};
+
+permit(
+    principal,
+    action,
+    resource
+) when {
+    principal.roles.contains("admin")
+};
+```
+
+See [Authorization Guide](docs/authorization.md) for more details.
+
 ## Headers Added
 
 On successful authentication, the agent adds these headers to the request:
@@ -113,8 +204,9 @@ On successful authentication, the agent adds these headers to the request:
 | Header | Description | Example |
 |--------|-------------|---------|
 | `X-User-Id` | Authenticated user ID | `user123` |
-| `X-Auth-Method` | Authentication method used | `jwt`, `api_key`, `basic` |
-| `X-Auth-Claim-*` | JWT claims (for JWT auth) | `X-Auth-Claim-role: admin` |
+| `X-Auth-Method` | Authentication method used | `jwt`, `oidc`, `mtls`, `api_key`, `basic`, `saml` |
+| `X-Auth-Claim-*` | JWT/OIDC claims (for token auth) | `X-Auth-Claim-role: admin` |
+| `X-Client-Cert-*` | Certificate info (for mTLS) | `X-Client-Cert-CN: service.example.com` |
 
 ## Configuration
 

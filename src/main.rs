@@ -1,8 +1,13 @@
 //! Sentinel Authentication Agent
 //!
 //! This agent provides authentication for the Sentinel proxy,
-//! supporting JWT/Bearer tokens, API keys, Basic auth, and SAML SSO.
+//! supporting JWT/Bearer tokens, API keys, Basic auth, SAML SSO,
+//! OIDC/OAuth 2.0, mTLS client certificates, and Cedar policy authorization.
 
+mod authz;
+mod exchange;
+mod mtls;
+mod oidc;
 mod saml;
 mod session;
 
@@ -22,6 +27,13 @@ use sentinel_agent_protocol::{
 };
 use std::sync::RwLock;
 
+use authz::{AuthzConfig, AuthzConfigJson, CedarAuthorizer};
+use exchange::{
+    handle_token_exchange, parse_exchange_request, SubjectTokenValidator, TokenExchangeConfig,
+    TokenExchangeConfigJson, TokenIssuer, TokenType, ValidatedSubject,
+};
+use mtls::{validate_client_cert, MtlsConfig, MtlsConfigJson};
+use oidc::{validate_oidc_token, JwksCache, OidcConfig, OidcConfigJson};
 use saml::{SamlConfig, SamlConfigJson, SamlProvider};
 use session::{spawn_cleanup_task, SessionId, SessionStore, DEFAULT_CLEANUP_INTERVAL_SECS};
 
@@ -90,6 +102,8 @@ pub enum AuthMethod {
     ApiKey,
     Basic,
     Saml,
+    Oidc,
+    Mtls,
     None,
 }
 
@@ -100,6 +114,8 @@ impl std::fmt::Display for AuthMethod {
             AuthMethod::ApiKey => write!(f, "api_key"),
             AuthMethod::Basic => write!(f, "basic"),
             AuthMethod::Saml => write!(f, "saml"),
+            AuthMethod::Oidc => write!(f, "oidc"),
+            AuthMethod::Mtls => write!(f, "mtls"),
             AuthMethod::None => write!(f, "none"),
         }
     }
@@ -185,6 +201,18 @@ pub struct AuthConfigJson {
     /// SAML configuration
     #[serde(default)]
     pub saml: SamlConfigJson,
+    /// OIDC/OAuth 2.0 configuration
+    #[serde(default)]
+    pub oidc: OidcConfigJson,
+    /// mTLS configuration
+    #[serde(default)]
+    pub mtls: MtlsConfigJson,
+    /// Cedar authorization configuration
+    #[serde(default)]
+    pub authz: AuthzConfigJson,
+    /// Token exchange configuration
+    #[serde(default)]
+    pub token_exchange: TokenExchangeConfigJson,
 }
 
 impl AuthConfig {
@@ -273,8 +301,22 @@ pub struct AuthAgent {
     session_store: Option<Arc<SessionStore>>,
     /// SAML configuration.
     saml_config: RwLock<SamlConfig>,
-    /// Buffered request body for ACS endpoint.
-    acs_body_buffer: RwLock<HashMap<String, Vec<u8>>>,
+    /// Buffered request body for ACS/token exchange endpoint.
+    body_buffer: RwLock<HashMap<String, Vec<u8>>>,
+    /// OIDC configuration.
+    oidc_config: RwLock<OidcConfig>,
+    /// OIDC JWKS cache (initialized when OIDC is enabled).
+    jwks_cache: RwLock<Option<Arc<JwksCache>>>,
+    /// mTLS configuration.
+    mtls_config: RwLock<MtlsConfig>,
+    /// Cedar authorization configuration.
+    authz_config: RwLock<AuthzConfig>,
+    /// Cedar authorizer (initialized when authz is enabled).
+    authorizer: RwLock<Option<CedarAuthorizer>>,
+    /// Token exchange configuration.
+    exchange_config: RwLock<TokenExchangeConfig>,
+    /// Token issuer (initialized when exchange is enabled).
+    token_issuer: RwLock<Option<TokenIssuer>>,
 }
 
 impl AuthAgent {
@@ -284,7 +326,14 @@ impl AuthAgent {
             saml_provider: RwLock::new(None),
             session_store,
             saml_config: RwLock::new(SamlConfig::default()),
-            acs_body_buffer: RwLock::new(HashMap::new()),
+            body_buffer: RwLock::new(HashMap::new()),
+            oidc_config: RwLock::new(OidcConfig::default()),
+            jwks_cache: RwLock::new(None),
+            mtls_config: RwLock::new(MtlsConfig::default()),
+            authz_config: RwLock::new(AuthzConfig::default()),
+            authorizer: RwLock::new(None),
+            exchange_config: RwLock::new(TokenExchangeConfig::default()),
+            token_issuer: RwLock::new(None),
         }
     }
 
@@ -309,6 +358,341 @@ impl AuthAgent {
         self.saml_config.read()
             .map(|c| c.clone())
             .map_err(|_| anyhow!("SAML config lock poisoned"))
+    }
+
+    /// Configure OIDC provider.
+    pub async fn configure_oidc(&self, config: OidcConfig) -> Result<()> {
+        if config.enabled {
+            let cache = JwksCache::new(config.jwks_url.clone(), config.jwks_refresh_secs).await?;
+            let mut guard = self.jwks_cache.write()
+                .map_err(|_| anyhow!("JWKS cache lock poisoned"))?;
+            *guard = Some(Arc::new(cache));
+            info!(issuer = %config.issuer, "OIDC configured");
+        }
+
+        let mut oidc_cfg = self.oidc_config.write()
+            .map_err(|_| anyhow!("OIDC config lock poisoned"))?;
+        *oidc_cfg = config;
+
+        Ok(())
+    }
+
+    /// Get OIDC config.
+    fn get_oidc_config(&self) -> Result<OidcConfig> {
+        self.oidc_config.read()
+            .map(|c| c.clone())
+            .map_err(|_| anyhow!("OIDC config lock poisoned"))
+    }
+
+    /// Configure mTLS.
+    pub fn configure_mtls(&self, config: MtlsConfig) -> Result<()> {
+        if let Err(e) = config.validate() {
+            return Err(anyhow!("mTLS config validation failed: {}", e));
+        }
+
+        let mut mtls_cfg = self.mtls_config.write()
+            .map_err(|_| anyhow!("mTLS config lock poisoned"))?;
+        *mtls_cfg = config;
+
+        info!("mTLS configured");
+        Ok(())
+    }
+
+    /// Get mTLS config.
+    fn get_mtls_config(&self) -> Result<MtlsConfig> {
+        self.mtls_config.read()
+            .map(|c| c.clone())
+            .map_err(|_| anyhow!("mTLS config lock poisoned"))
+    }
+
+    /// Configure Cedar authorization.
+    pub fn configure_authz(&self, config: AuthzConfig) -> Result<()> {
+        if config.enabled {
+            let authorizer = CedarAuthorizer::new(&config)?;
+            let mut guard = self.authorizer.write()
+                .map_err(|_| anyhow!("Authorizer lock poisoned"))?;
+            *guard = Some(authorizer);
+            info!("Cedar authorization configured");
+        }
+
+        let mut authz_cfg = self.authz_config.write()
+            .map_err(|_| anyhow!("Authz config lock poisoned"))?;
+        *authz_cfg = config;
+
+        Ok(())
+    }
+
+    /// Get authz config.
+    fn get_authz_config(&self) -> Result<AuthzConfig> {
+        self.authz_config.read()
+            .map(|c| c.clone())
+            .map_err(|_| anyhow!("Authz config lock poisoned"))
+    }
+
+    /// Configure token exchange.
+    pub fn configure_exchange(&self, config: TokenExchangeConfig) -> Result<()> {
+        if config.enabled {
+            let issuer = TokenIssuer::new(&config)?;
+            let mut guard = self.token_issuer.write()
+                .map_err(|_| anyhow!("Token issuer lock poisoned"))?;
+            *guard = Some(issuer);
+            info!(endpoint = %config.endpoint_path, "Token exchange configured");
+        }
+
+        let mut exchange_cfg = self.exchange_config.write()
+            .map_err(|_| anyhow!("Exchange config lock poisoned"))?;
+        *exchange_cfg = config;
+
+        Ok(())
+    }
+
+    /// Get exchange config.
+    fn get_exchange_config(&self) -> Result<TokenExchangeConfig> {
+        self.exchange_config.read()
+            .map(|c| c.clone())
+            .map_err(|_| anyhow!("Exchange config lock poisoned"))
+    }
+
+    /// Try to authenticate via mTLS client certificate.
+    fn authenticate_mtls(&self, headers: &HashMap<String, Vec<String>>) -> Result<Identity> {
+        let mtls_config = self.get_mtls_config()?;
+
+        if !mtls_config.enabled {
+            return Err(anyhow!("mTLS not enabled"));
+        }
+
+        // Get certificate from header
+        let cert_header = headers.iter()
+            .find(|(k, _)| k.to_lowercase() == mtls_config.client_cert_header.to_lowercase())
+            .and_then(|(_, v)| v.first())
+            .ok_or_else(|| anyhow!("No client certificate header"))?;
+
+        let identity = validate_client_cert(&mtls_config, cert_header)?;
+
+        let mut claims = HashMap::new();
+        for (k, v) in identity.claims {
+            claims.insert(k, serde_json::Value::String(v));
+        }
+
+        Ok(Identity {
+            id: identity.user_id,
+            method: AuthMethod::Mtls,
+            claims,
+        })
+    }
+
+    /// Try to authenticate via OIDC token.
+    async fn authenticate_oidc(&self, token: &str) -> Result<Identity> {
+        let oidc_config = self.get_oidc_config()?;
+
+        if !oidc_config.enabled {
+            return Err(anyhow!("OIDC not enabled"));
+        }
+
+        // Clone the Arc before the await to avoid holding the lock across await
+        let jwks = {
+            let jwks_guard = self.jwks_cache.read()
+                .map_err(|_| anyhow!("JWKS cache lock poisoned"))?;
+            jwks_guard.as_ref()
+                .ok_or_else(|| anyhow!("JWKS cache not initialized"))?
+                .clone()
+        };
+
+        let identity = validate_oidc_token(&oidc_config, jwks.as_ref(), token).await?;
+
+        let mut claims = HashMap::new();
+        for (k, v) in identity.claims {
+            claims.insert(k, serde_json::Value::String(v));
+        }
+
+        Ok(Identity {
+            id: identity.user_id,
+            method: AuthMethod::Oidc,
+            claims,
+        })
+    }
+
+    /// Handle token exchange request body.
+    async fn handle_exchange_body(&self, _correlation_id: &str, exchange_key: &str) -> AgentResponse {
+        let body_data = {
+            let mut buffer = match self.body_buffer.write() {
+                Ok(b) => b,
+                Err(_) => {
+                    return AgentResponse::block(500, Some("Internal error".to_string()));
+                }
+            };
+            buffer.remove(exchange_key).unwrap_or_default()
+        };
+
+        let body_str = match String::from_utf8(body_data) {
+            Ok(s) => s,
+            Err(_) => {
+                return self.exchange_error_response("invalid_request", "Invalid request body encoding");
+            }
+        };
+
+        // Parse the request
+        let request = match parse_exchange_request(&body_str) {
+            Ok(r) => r,
+            Err(e) => {
+                return self.exchange_error_response(&e.error, e.error_description.as_deref().unwrap_or(""));
+            }
+        };
+
+        let exchange_config = match self.get_exchange_config() {
+            Ok(c) => c,
+            Err(_) => {
+                return self.exchange_error_response("server_error", "Configuration error");
+            }
+        };
+
+        // Validate the subject token synchronously first
+        let validated = {
+            let validator = AuthAgentTokenValidator { agent: self };
+            let token_type = match exchange::TokenType::from_urn(&request.subject_token_type) {
+                Some(t) => t,
+                None => {
+                    return self.exchange_error_response("unsupported_token_type", "Unknown subject_token_type");
+                }
+            };
+            match validator.validate(&request.subject_token, &token_type) {
+                Ok(v) => v,
+                Err(e) => {
+                    return self.exchange_error_response("invalid_grant", &format!("Invalid subject token: {}", e));
+                }
+            }
+        };
+
+        // Issue new token
+        let (token, expires_in, scope) = {
+            let issuer_guard = match self.token_issuer.read() {
+                Ok(g) => g,
+                Err(_) => {
+                    return self.exchange_error_response("server_error", "Internal error");
+                }
+            };
+
+            let issuer = match issuer_guard.as_ref() {
+                Some(i) => i,
+                None => {
+                    return self.exchange_error_response("server_error", "Token exchange not configured");
+                }
+            };
+
+            // Determine scopes
+            let new_scopes: Vec<String> = if let Some(ref requested_scope) = request.scope {
+                requested_scope.split_whitespace().map(String::from).collect()
+            } else {
+                validated.scopes.clone()
+            };
+
+            match issuer.issue_token(
+                &validated.subject,
+                request.audience.as_deref(),
+                Some(&new_scopes),
+                validated.claims,
+                None,
+            ) {
+                Ok(issued) => (issued.token, issued.expires_in, issued.scope),
+                Err(e) => {
+                    warn!(error = %e, "Failed to issue token");
+                    return self.exchange_error_response("server_error", "Failed to issue token");
+                }
+            }
+        };
+
+        let requested_type = request.requested_token_type
+            .as_deref()
+            .and_then(exchange::TokenType::from_urn)
+            .unwrap_or(exchange::TokenType::AccessToken);
+
+        let response = exchange::TokenExchangeResponse {
+            access_token: token,
+            issued_token_type: requested_type.as_urn().to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in,
+            scope,
+            refresh_token: None,
+        };
+
+        match serde_json::to_string(&response) {
+            Ok(json_body) => {
+                info!("Token exchange successful");
+
+                AgentResponse::block(200, Some(json_body))
+                    .add_response_header(HeaderOp::Set {
+                        name: "Content-Type".to_string(),
+                        value: "application/json".to_string(),
+                    })
+                    .with_audit(AuditMetadata {
+                        tags: vec!["auth".to_string(), "token_exchange".to_string()],
+                        ..Default::default()
+                    })
+            }
+            Err(_) => {
+                self.exchange_error_response("server_error", "Failed to serialize response")
+            }
+        }
+    }
+
+    /// Build token exchange error response.
+    fn exchange_error_response(&self, error: &str, description: &str) -> AgentResponse {
+        let error_body = serde_json::json!({
+            "error": error,
+            "error_description": description
+        });
+
+        AgentResponse::block(400, Some(error_body.to_string()))
+            .add_response_header(HeaderOp::Set {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            })
+            .with_audit(AuditMetadata {
+                tags: vec!["auth".to_string(), "token_exchange".to_string(), "error".to_string()],
+                reason_codes: vec![error.to_string()],
+                ..Default::default()
+            })
+    }
+
+    /// Check authorization using Cedar policies.
+    fn check_authorization(&self, identity: &Identity, method: &str, path: &str) -> Result<bool> {
+        let authz_config = self.get_authz_config()?;
+
+        if !authz_config.enabled {
+            return Ok(true); // Authorization not enabled, allow all
+        }
+
+        let authorizer_guard = self.authorizer.read()
+            .map_err(|_| anyhow!("Authorizer lock poisoned"))?;
+
+        let authorizer = authorizer_guard.as_ref()
+            .ok_or_else(|| anyhow!("Authorizer not initialized"))?;
+
+        // Build claims map for authorization context
+        let claims: HashMap<String, String> = identity.claims.iter()
+            .filter_map(|(k, v)| {
+                if let serde_json::Value::String(s) = v {
+                    Some((k.clone(), s.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let decision = authorizer.is_authorized(&identity.id, method, path, &claims);
+
+        if !decision.allowed {
+            debug!(
+                user = %identity.id,
+                action = %method,
+                resource = %path,
+                reason = ?decision.reason,
+                policies = ?decision.policy_ids,
+                "Authorization denied"
+            );
+        }
+
+        Ok(decision.allowed)
     }
 
     /// Try to authenticate via SAML session cookie.
@@ -426,6 +810,71 @@ impl AuthAgent {
         })
     }
 
+    /// Build response headers with identity and authorization check.
+    fn build_identity_response(
+        &self,
+        identity: Identity,
+        user_id_header: &str,
+        auth_method_header: &str,
+        request_method: &str,
+        request_path: &str,
+    ) -> AgentResponse {
+        // Check authorization
+        match self.check_authorization(&identity, request_method, request_path) {
+            Ok(true) => {
+                // Authorized - build success response
+                let mut response = AgentResponse::default_allow()
+                    .add_request_header(HeaderOp::Set {
+                        name: user_id_header.to_string(),
+                        value: identity.id.clone(),
+                    })
+                    .add_request_header(HeaderOp::Set {
+                        name: auth_method_header.to_string(),
+                        value: identity.method.to_string(),
+                    });
+
+                // Add claims as headers
+                for (key, value) in &identity.claims {
+                    if let serde_json::Value::String(s) = value {
+                        response = response.add_request_header(HeaderOp::Set {
+                            name: format!("X-Auth-Claim-{}", key),
+                            value: s.clone(),
+                        });
+                    }
+                }
+
+                response.with_audit(AuditMetadata {
+                    tags: vec!["auth".to_string(), identity.method.to_string()],
+                    ..Default::default()
+                })
+            }
+            Ok(false) => {
+                // Not authorized
+                warn!(
+                    user = %identity.id,
+                    method = %request_method,
+                    path = %request_path,
+                    "Authorization denied"
+                );
+                AgentResponse::block(403, Some("Forbidden".to_string()))
+                    .with_audit(AuditMetadata {
+                        tags: vec!["auth".to_string(), "authz_denied".to_string()],
+                        reason_codes: vec!["AUTHORIZATION_DENIED".to_string()],
+                        ..Default::default()
+                    })
+            }
+            Err(e) => {
+                warn!(error = %e, "Authorization check failed");
+                AgentResponse::block(500, Some("Authorization error".to_string()))
+                    .with_audit(AuditMetadata {
+                        tags: vec!["auth".to_string(), "authz_error".to_string()],
+                        reason_codes: vec!["AUTHORIZATION_ERROR".to_string()],
+                        ..Default::default()
+                    })
+            }
+        }
+    }
+
     /// Reconfigure the agent with new settings
     pub fn reconfigure(&self, json_config: AuthConfigJson) -> Result<()> {
         let mut config = self.config.write().map_err(|_| anyhow!("Failed to acquire write lock"))?;
@@ -513,8 +962,30 @@ impl AuthAgent {
         json_config.saml.apply_to(&mut saml_config);
         self.configure_saml(saml_config)?;
 
+        // Update mTLS config
+        let mut mtls_config = self.get_mtls_config().unwrap_or_default();
+        json_config.mtls.apply_to(&mut mtls_config);
+        self.configure_mtls(mtls_config)?;
+
+        // Update authz config
+        let mut authz_config = self.get_authz_config().unwrap_or_default();
+        json_config.authz.apply_to(&mut authz_config);
+        self.configure_authz(authz_config)?;
+
+        // Update token exchange config
+        let mut exchange_config = self.get_exchange_config().unwrap_or_default();
+        json_config.token_exchange.apply_to(&mut exchange_config);
+        self.configure_exchange(exchange_config)?;
+
         info!("Reconfigured auth agent");
         Ok(())
+    }
+
+    /// Reconfigure OIDC (async due to JWKS fetch).
+    pub async fn reconfigure_oidc(&self, json_config: &OidcConfigJson) -> Result<()> {
+        let mut oidc_config = self.get_oidc_config().unwrap_or_default();
+        json_config.apply_to(&mut oidc_config);
+        self.configure_oidc(oidc_config).await
     }
 
     /// Authenticate a request
@@ -654,6 +1125,47 @@ impl AuthAgent {
     }
 }
 
+/// Token validator for token exchange that uses the agent's existing validators.
+struct AuthAgentTokenValidator<'a> {
+    agent: &'a AuthAgent,
+}
+
+impl SubjectTokenValidator for AuthAgentTokenValidator<'_> {
+    fn validate(&self, token: &str, token_type: &TokenType) -> Result<ValidatedSubject> {
+        match token_type {
+            TokenType::Jwt | TokenType::AccessToken | TokenType::IdToken => {
+                // Try to validate as JWT using existing config
+                let config = self.agent.config.read()
+                    .map_err(|_| anyhow!("Failed to acquire config lock"))?;
+
+                let identity = AuthAgent::validate_jwt(&config, token)?;
+
+                let mut claims = HashMap::new();
+                for (k, v) in identity.claims {
+                    claims.insert(k, v);
+                }
+
+                Ok(ValidatedSubject {
+                    subject: identity.id,
+                    scopes: claims.get("scope")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.split_whitespace().map(String::from).collect())
+                        .unwrap_or_default(),
+                    claims,
+                })
+            }
+            TokenType::Saml2 => {
+                // SAML token validation would require the full SAML provider
+                // For now, return an error - SAML exchange requires session-based flow
+                Err(anyhow!("SAML token exchange requires ACS flow"))
+            }
+            TokenType::RefreshToken => {
+                Err(anyhow!("Refresh token exchange not supported"))
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentHandler for AuthAgent {
     async fn on_configure(&self, event: ConfigureEvent) -> AgentResponse {
@@ -664,6 +1176,12 @@ impl AgentHandler for AuthAgent {
                 return AgentResponse::default_allow();
             }
         };
+
+        // Configure OIDC first (async due to JWKS fetch)
+        if let Err(e) = self.reconfigure_oidc(&json_config.oidc).await {
+            warn!("Failed to configure OIDC: {}", e);
+            // Don't fail entirely, OIDC is optional
+        }
 
         if let Err(e) = self.reconfigure(json_config) {
             warn!("Failed to reconfigure auth agent: {}", e);
@@ -697,36 +1215,56 @@ impl AgentHandler for AuthAgent {
             Err(_) => SamlConfig::default(),
         };
 
-        // Get request path for SAML path matching
+        // Get request path and method for matching
         let request_path = event.headers.get("path")
             .or_else(|| event.headers.get(":path"))
             .and_then(|v| v.first())
             .map(|s| s.as_str())
             .unwrap_or("/");
 
-        // Check if this is the SAML ACS endpoint (POST)
-        if saml_config.enabled && saml_config.is_acs_path(request_path) {
-            let method = event.headers.get("method")
-                .or_else(|| event.headers.get(":method"))
-                .and_then(|v| v.first())
-                .map(|s| s.to_uppercase())
-                .unwrap_or_default();
+        let request_method = event.headers.get("method")
+            .or_else(|| event.headers.get(":method"))
+            .and_then(|v| v.first())
+            .map(|s| s.to_uppercase())
+            .unwrap_or_default();
 
-            if method == "POST" {
-                // Need to read the body to get SAMLResponse
-                debug!("SAML ACS endpoint hit, waiting for body");
+        // Check if this is the token exchange endpoint (POST)
+        let exchange_config = self.get_exchange_config().unwrap_or_default();
+        if exchange_config.enabled && request_path == exchange_config.endpoint_path && request_method == "POST" {
+            debug!("Token exchange endpoint hit, waiting for body");
 
-                // Store correlation ID for body buffering
-                if let Ok(mut buffer) = self.acs_body_buffer.write() {
-                    buffer.insert(event.metadata.correlation_id.clone(), Vec::new());
-                }
-
-                // Return needs_more_data to signal we need the request body
-                return AgentResponse::needs_more_data();
+            // Store correlation ID for body buffering
+            if let Ok(mut buffer) = self.body_buffer.write() {
+                buffer.insert(format!("exchange:{}", event.metadata.correlation_id), Vec::new());
             }
+
+            return AgentResponse::needs_more_data();
         }
 
-        // Try SAML session authentication first if enabled
+        // Check if this is the SAML ACS endpoint (POST)
+        if saml_config.enabled && saml_config.is_acs_path(request_path) && request_method == "POST" {
+            debug!("SAML ACS endpoint hit, waiting for body");
+
+            // Store correlation ID for body buffering
+            if let Ok(mut buffer) = self.body_buffer.write() {
+                buffer.insert(event.metadata.correlation_id.clone(), Vec::new());
+            }
+
+            // Return needs_more_data to signal we need the request body
+            return AgentResponse::needs_more_data();
+        }
+
+        // Try mTLS authentication first (highest trust level)
+        if let Ok(identity) = self.authenticate_mtls(&event.headers) {
+            info!(
+                user_id = %identity.id,
+                method = %identity.method,
+                "mTLS authentication successful"
+            );
+            return self.build_identity_response(identity, &user_id_header, &auth_method_header, &request_method, request_path);
+        }
+
+        // Try SAML session authentication if enabled
         if saml_config.enabled && saml_config.should_protect_path(request_path) {
             if let Ok(identity) = self.authenticate_saml_session(&event.headers) {
                 info!(
@@ -735,6 +1273,24 @@ impl AgentHandler for AuthAgent {
                     "SAML session authentication successful"
                 );
                 return self.build_saml_identity_response(&identity, &saml_config, &user_id_header, &auth_method_header);
+            }
+        }
+
+        // Try OIDC authentication (Bearer token from OIDC IdP)
+        if let Some(auth_header) = event.headers.iter()
+            .find(|(k, _)| k.to_lowercase() == "authorization")
+            .and_then(|(_, v)| v.first())
+        {
+            if auth_header.starts_with("Bearer ") || auth_header.starts_with("bearer ") {
+                let token = &auth_header[7..];
+                if let Ok(identity) = self.authenticate_oidc(token).await {
+                    info!(
+                        user_id = %identity.id,
+                        method = %identity.method,
+                        "OIDC authentication successful"
+                    );
+                    return self.build_identity_response(identity, &user_id_header, &auth_method_header, &request_method, request_path);
+                }
             }
         }
 
@@ -747,30 +1303,7 @@ impl AgentHandler for AuthAgent {
                     "Authentication successful"
                 );
 
-                let mut response = AgentResponse::default_allow()
-                    .add_request_header(HeaderOp::Set {
-                        name: user_id_header,
-                        value: identity.id.clone(),
-                    })
-                    .add_request_header(HeaderOp::Set {
-                        name: auth_method_header,
-                        value: identity.method.to_string(),
-                    });
-
-                // Add claims as headers
-                for (key, value) in &identity.claims {
-                    if let serde_json::Value::String(s) = value {
-                        response = response.add_request_header(HeaderOp::Set {
-                            name: format!("X-Auth-Claim-{}", key),
-                            value: s.clone(),
-                        });
-                    }
-                }
-
-                response.with_audit(AuditMetadata {
-                    tags: vec!["auth".to_string(), identity.method.to_string()],
-                    ..Default::default()
-                })
+                self.build_identity_response(identity, &user_id_header, &auth_method_header, &request_method, request_path)
             }
             Err(e) => {
                 debug!("Authentication failed: {}", e);
@@ -811,17 +1344,38 @@ impl AgentHandler for AuthAgent {
     }
 
     async fn on_request_body_chunk(&self, event: RequestBodyChunkEvent) -> AgentResponse {
+        // Check if this is a token exchange request
+        let exchange_key = format!("exchange:{}", event.correlation_id);
+        let is_exchange = {
+            if let Ok(buffer) = self.body_buffer.read() {
+                buffer.contains_key(&exchange_key)
+            } else {
+                false
+            }
+        };
+
         // Buffer the chunk (data is already a String)
-        if let Ok(mut buffer) = self.acs_body_buffer.write() {
-            if let Some(body) = buffer.get_mut(&event.correlation_id) {
+        if let Ok(mut buffer) = self.body_buffer.write() {
+            let key = if is_exchange {
+                exchange_key.clone()
+            } else {
+                event.correlation_id.clone()
+            };
+            if let Some(body) = buffer.get_mut(&key) {
                 body.extend_from_slice(event.data.as_bytes());
             }
         }
 
-        // If this is the last chunk, process the SAML response
+        // If this is the last chunk, process the request
         if event.is_last {
+            // Handle token exchange
+            if is_exchange {
+                return self.handle_exchange_body(&event.correlation_id, &exchange_key).await;
+            }
+
+            // Handle SAML ACS
             let body_data = {
-                let mut buffer = match self.acs_body_buffer.write() {
+                let mut buffer = match self.body_buffer.write() {
                     Ok(b) => b,
                     Err(_) => {
                         return AgentResponse::block(500, Some("Internal error".to_string()));

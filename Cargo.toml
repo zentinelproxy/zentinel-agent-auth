@@ -76,5 +76,17 @@ flate2 = "1.0"
 # URL encoding
 urlencoding = "2.1"
 
+# OIDC/JWKS - HTTP client for fetching JWKS
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Cedar Policy Engine - authorization
+cedar-policy = "4.2"
+
+# mTLS - X.509 certificate parsing
+x509-parser = { version = "0.16", features = ["verify"] }
+
+# Token Exchange - form parsing
+serde_urlencoded = "0.7"
+
 [dev-dependencies]
 tempfile = "3.12"

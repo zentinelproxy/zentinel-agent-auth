@@ -141,6 +141,152 @@ See [SAML Authentication](saml.md) for complete SAML configuration options.
 | `session-ttl-secs` | int | `28800` | Session lifetime (8 hours) |
 | `session-store-path` | string | `/var/lib/sentinel-auth/sessions.redb` | Session database path |
 
+## OIDC Configuration
+
+OpenID Connect / OAuth 2.0 authentication with automatic JWKS key rotation.
+
+See [OIDC Authentication](oidc.md) for detailed setup guide.
+
+### JSON Configuration
+
+```json
+{
+  "oidc": {
+    "enabled": true,
+    "issuer": "https://auth.example.com",
+    "jwks-url": "https://auth.example.com/.well-known/jwks.json",
+    "audience": "my-api",
+    "required-scopes": ["read", "write"],
+    "jwks-refresh-secs": 3600,
+    "clock-skew-secs": 30
+  }
+}
+```
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable OIDC authentication |
+| `issuer` | string | - | Expected token issuer (required) |
+| `jwks-url` | string | - | URL to fetch JWKS (required) |
+| `audience` | string | - | Expected audience claim |
+| `required-scopes` | array | `[]` | Scopes that must be present |
+| `jwks-refresh-secs` | int | `3600` | JWKS cache refresh interval |
+| `clock-skew-secs` | int | `30` | Clock skew tolerance |
+
+## mTLS Configuration
+
+Client certificate authentication for zero-trust architectures.
+
+See [mTLS Authentication](mtls.md) for detailed setup guide.
+
+### JSON Configuration
+
+```json
+{
+  "mtls": {
+    "enabled": true,
+    "client-cert-header": "X-Client-Cert",
+    "ca-cert-path": "/etc/ssl/ca.crt",
+    "allowed-dns": ["CN=service.example.com,O=Example Corp"],
+    "allowed-sans": ["service@example.com"],
+    "extract-cn-as-user": true,
+    "extract-san-email-as-user": false,
+    "log-certs": false
+  }
+}
+```
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable mTLS authentication |
+| `client-cert-header` | string | `X-Client-Cert` | Header containing client certificate |
+| `ca-cert-path` | string | - | CA certificate for chain validation |
+| `allowed-dns` | array | `[]` | Allowed Distinguished Names |
+| `allowed-sans` | array | `[]` | Allowed Subject Alternative Names |
+| `extract-cn-as-user` | bool | `true` | Use CN as user ID |
+| `extract-san-email-as-user` | bool | `false` | Use SAN email as user ID |
+| `log-certs` | bool | `false` | Log certificate details (debug) |
+
+## Authorization Configuration
+
+Cedar policy engine for fine-grained access control.
+
+See [Authorization](authorization.md) for policy writing guide.
+
+### JSON Configuration
+
+```json
+{
+  "authz": {
+    "enabled": true,
+    "policy-file": "/etc/sentinel/policies/auth.cedar",
+    "default-decision": "deny",
+    "principal-claim": "sub",
+    "roles-claim": "roles"
+  }
+}
+```
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable authorization |
+| `policy-file` | string | - | Path to Cedar policy file |
+| `policy-inline` | string | - | Inline Cedar policy text |
+| `default-decision` | string | `deny` | Decision when no policy matches (`allow` or `deny`) |
+| `principal-claim` | string | `sub` | JWT claim for principal ID |
+| `roles-claim` | string | - | JWT claim containing roles array |
+
+## Token Exchange Configuration
+
+RFC 8693 token exchange endpoint for converting between token types.
+
+See [Token Exchange](token-exchange.md) for detailed guide.
+
+### JSON Configuration
+
+```json
+{
+  "token-exchange": {
+    "enabled": true,
+    "endpoint-path": "/token/exchange",
+    "issuer": "https://auth.internal.example.com",
+    "signing-key-file": "/etc/sentinel/jwt-private.pem",
+    "signing-algorithm": "RS256",
+    "default-audience": "internal-api",
+    "token-ttl-secs": 3600,
+    "allowed-exchanges": [
+      {
+        "subject-token-type": "saml2",
+        "issued-token-type": "access_token"
+      },
+      {
+        "subject-token-type": "jwt",
+        "issued-token-type": "access_token"
+      }
+    ]
+  }
+}
+```
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable token exchange endpoint |
+| `endpoint-path` | string | `/token/exchange` | Path for exchange endpoint |
+| `issuer` | string | - | Issuer for exchanged tokens (required) |
+| `signing-key-file` | string | - | Path to signing key (required) |
+| `signing-algorithm` | string | `RS256` | Algorithm for signing (`RS256`, `ES256`, `HS256`) |
+| `default-audience` | string | - | Default audience for issued tokens |
+| `token-ttl-secs` | int | `3600` | Token lifetime in seconds |
+| `allowed-exchanges` | array | `[]` | Allowed token type conversions |
+
 ## Environment Variable Examples
 
 ```bash
@@ -212,18 +358,26 @@ For SAML, use `attribute-mapping` to map SAML attributes to headers:
 
 When multiple auth methods are configured, they are checked in this order:
 
-1. **Session cookie** (SAML) - if present and valid
-2. **Authorization: Bearer** (JWT) - if header present
-3. **API Key header** - if configured header present
-4. **Authorization: Basic** - if header present
+1. **mTLS Client Certificate** - if `X-Client-Cert` header present
+2. **Session cookie** (SAML) - if present and valid
+3. **Authorization: Bearer** (OIDC) - if OIDC configured and header present
+4. **Authorization: Bearer** (JWT) - if JWT configured and header present
+5. **API Key header** - if configured header present
+6. **Authorization: Basic** - if header present
 
 The first successful authentication wins. If all methods fail, the agent returns 401 (or allows the request if `fail-open` is true).
+
+After authentication, if authorization is enabled, the Cedar policy engine evaluates the request. A 403 Forbidden is returned if the policy denies access.
 
 ## Security Recommendations
 
 1. **Use environment variables** for secrets, not command-line arguments
 2. **Use RS256/ES256** for JWT in production (asymmetric keys)
 3. **Set `fail-open: false`** for security-critical routes
-4. **Use HTTPS** for all SAML endpoints (required by spec)
-5. **Rotate secrets** regularly (JWT secrets, API keys)
+4. **Use HTTPS** for all SAML and OIDC endpoints (required by spec)
+5. **Rotate secrets** regularly (JWT secrets, API keys, signing keys)
 6. **Limit session TTL** based on security requirements
+7. **Use default deny** for Cedar authorization policies
+8. **Validate JWKS sources** - only configure trusted issuer URLs
+9. **Use CA validation** for mTLS when possible
+10. **Rate limit token exchange** endpoint to prevent abuse

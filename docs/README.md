@@ -1,6 +1,6 @@
 # Sentinel Auth Agent Documentation
 
-This directory contains documentation for the Sentinel Authentication Agent.
+This directory contains documentation for the Sentinel Authentication and Authorization Agent.
 
 ## Contents
 
@@ -9,6 +9,10 @@ This directory contains documentation for the Sentinel Authentication Agent.
 | [Configuration Reference](configuration.md) | Complete configuration options for all auth methods |
 | [SAML Authentication](saml.md) | SAML SSO setup and IdP integration guide |
 | [Session Management](session-management.md) | Session persistence and lifecycle |
+| [OIDC Authentication](oidc.md) | OIDC/OAuth 2.0 with JWKS auto-refresh |
+| [mTLS Authentication](mtls.md) | Client certificate authentication |
+| [Authorization](authorization.md) | Cedar policy engine guide |
+| [Token Exchange](token-exchange.md) | RFC 8693 token exchange |
 
 ## Quick Links
 
@@ -18,12 +22,25 @@ This directory contains documentation for the Sentinel Authentication Agent.
 
 ## Authentication Methods
 
-The agent supports four authentication methods:
+The agent supports six authentication methods:
 
 1. **JWT/Bearer Tokens** - Industry-standard JSON Web Tokens with HS256, RS256, ES256
-2. **API Keys** - Simple header-based authentication for service-to-service calls
-3. **Basic Auth** - Username/password authentication (RFC 7617)
-4. **SAML SSO** - Enterprise single sign-on with session persistence
+2. **OIDC/OAuth 2.0** - OpenID Connect with automatic JWKS key rotation
+3. **API Keys** - Simple header-based authentication for service-to-service calls
+4. **Basic Auth** - Username/password authentication (RFC 7617)
+5. **SAML SSO** - Enterprise single sign-on with session persistence
+6. **mTLS Client Certificates** - X.509 certificate-based authentication for zero-trust
+
+## Authorization
+
+The agent supports policy-based authorization using the Cedar Policy Engine:
+
+- **Cedar Policies** - Define fine-grained access control with principal/action/resource model
+- **Default deny** - Secure by default with explicit allow policies
+
+## Token Services
+
+- **Token Exchange (RFC 8693)** - Convert between token types (SAML→JWT, external→internal JWT)
 
 ## Architecture
 
@@ -36,11 +53,17 @@ The agent supports four authentication methods:
                     ┌──────────────────┐
                     │   Auth Agent     │
                     │  ┌────────────┐  │
-                    │  │ JWT/API/   │  │
-                    │  │ Basic Auth │  │
+                    │  │ AuthN      │  │
+                    │  │ JWT/OIDC/  │  │
+                    │  │ mTLS/SAML  │  │
                     │  └────────────┘  │
                     │  ┌────────────┐  │
-                    │  │ SAML SSO   │  │
+                    │  │ AuthZ      │  │
+                    │  │ Cedar      │  │
+                    │  └────────────┘  │
+                    │  ┌────────────┐  │
+                    │  │ Token      │  │
+                    │  │ Exchange   │  │
                     │  └────────────┘  │
                     │  ┌────────────┐  │
                     │  │ Session    │  │
@@ -68,6 +91,33 @@ The agent supports four authentication methods:
 5. Agent validates assertion, creates session, sets cookie
 6. Client retries with session cookie
 7. Agent validates session, adds identity headers
+
+### OIDC/OAuth 2.0
+
+1. Client sends request with OAuth 2.0 Bearer token
+2. Agent extracts `kid` from JWT header
+3. Agent looks up signing key in JWKS cache (refreshes if needed)
+4. Agent validates token signature, issuer, audience, expiry
+5. On success: adds identity headers with claims, allows request
+6. On failure: returns 401 Unauthorized
+
+### mTLS Client Certificates
+
+1. Client connects with TLS client certificate
+2. Sentinel proxy terminates TLS, extracts certificate
+3. Proxy forwards certificate in `X-Client-Cert` header
+4. Agent parses certificate, checks DN/SAN allowlists
+5. On success: adds identity headers (CN as user ID), allows request
+6. On failure: returns 401 Unauthorized
+
+### Authorization (Cedar)
+
+After authentication:
+
+1. Agent builds Cedar request (principal, action, resource, context)
+2. Cedar evaluates policies against request
+3. If allowed: request proceeds to upstream
+4. If denied: returns 403 Forbidden with policy reason
 
 ## Getting Help
 
