@@ -1,14 +1,21 @@
 # sentinel-agent-auth
 
-Authentication agent for [Sentinel](https://github.com/raskell-io/sentinel) reverse proxy. Supports JWT/Bearer tokens, API keys, and Basic authentication.
+Authentication agent for [Sentinel](https://github.com/raskell-io/sentinel) reverse proxy. Supports JWT/Bearer tokens, API keys, Basic authentication, and SAML SSO.
 
 ## Features
 
 - **JWT/Bearer tokens** - HS256, RS256, ES256 and other algorithms
 - **API keys** - Simple header-based authentication
 - **Basic auth** - Username/password authentication
+- **SAML SSO** - Enterprise single sign-on with session persistence
 - Configurable user ID and auth method headers
 - Fail-open mode for graceful degradation
+
+## Documentation
+
+- [Configuration Reference](docs/configuration.md) - Complete configuration options
+- [SAML Authentication](docs/saml.md) - SAML SSO setup and IdP integration
+- [Session Management](docs/session-management.md) - Session persistence and lifecycle
 
 ## Installation
 
