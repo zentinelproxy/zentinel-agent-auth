@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Sentinel protocol
-sentinel-agent-protocol = { path = "../sentinel/crates/agent-protocol" }
+sentinel-agent-protocol = "0.2"
 sentinel-common = "0.1"
 
 # Async runtime
