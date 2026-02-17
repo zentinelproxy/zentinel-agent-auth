@@ -1,6 +1,6 @@
 # Configuration Reference
 
-The auth agent can be configured via command-line arguments, environment variables, or dynamic configuration from the Sentinel proxy.
+The auth agent can be configured via command-line arguments, environment variables, or dynamic configuration from the Zentinel proxy.
 
 ## Command-Line Options
 
@@ -8,7 +8,7 @@ The auth agent can be configured via command-line arguments, environment variabl
 
 | Option | Environment | Description | Default |
 |--------|-------------|-------------|---------|
-| `--socket` | `AGENT_SOCKET` | Unix socket path | `/tmp/sentinel-auth.sock` |
+| `--socket` | `AGENT_SOCKET` | Unix socket path | `/tmp/zentinel-auth.sock` |
 
 ### JWT Configuration
 
@@ -49,16 +49,16 @@ The auth agent can be configured via command-line arguments, environment variabl
 
 ## Dynamic Configuration (JSON)
 
-The agent supports runtime reconfiguration via Sentinel's `on_configure` event. Configuration is sent as JSON in the agent config block.
+The agent supports runtime reconfiguration via Zentinel's `on_configure` event. Configuration is sent as JSON in the agent config block.
 
-### Sentinel Proxy Configuration
+### Zentinel Proxy Configuration
 
 ```kdl
 agents {
     agent "auth" {
         type "custom"
         transport "unix_socket" {
-            path "/var/run/sentinel/auth.sock"
+            path "/var/run/zentinel/auth.sock"
         }
         events ["request_headers" "request_body_chunk"]
         timeout-ms 100
@@ -139,7 +139,7 @@ See [SAML Authentication](saml.md) for complete SAML configuration options.
 | `idp-entity-id` | string | - | IdP entity ID |
 | `idp-metadata-url` | string | - | URL to fetch IdP metadata |
 | `session-ttl-secs` | int | `28800` | Session lifetime (8 hours) |
-| `session-store-path` | string | `/var/lib/sentinel-auth/sessions.redb` | Session database path |
+| `session-store-path` | string | `/var/lib/zentinel-auth/sessions.redb` | Session database path |
 
 ## OIDC Configuration
 
@@ -223,7 +223,7 @@ See [Authorization](authorization.md) for policy writing guide.
 {
   "authz": {
     "enabled": true,
-    "policy-file": "/etc/sentinel/policies/auth.cedar",
+    "policy-file": "/etc/zentinel/policies/auth.cedar",
     "default-decision": "deny",
     "principal-claim": "sub",
     "roles-claim": "roles"
@@ -256,7 +256,7 @@ See [Token Exchange](token-exchange.md) for detailed guide.
     "enabled": true,
     "endpoint-path": "/token/exchange",
     "issuer": "https://auth.internal.example.com",
-    "signing-key-file": "/etc/sentinel/jwt-private.pem",
+    "signing-key-file": "/etc/zentinel/jwt-private.pem",
     "signing-algorithm": "RS256",
     "default-audience": "internal-api",
     "token-ttl-secs": 3600,
@@ -297,7 +297,7 @@ export JWT_AUDIENCE="my-api"
 
 # JWT with RS256
 export JWT_ALGORITHM="RS256"
-export JWT_PUBLIC_KEY="/etc/sentinel/jwt-public.pem"
+export JWT_PUBLIC_KEY="/etc/zentinel/jwt-public.pem"
 
 # API Keys
 export API_KEYS="sk_live_abc123:production,sk_test_xyz:development"
@@ -310,7 +310,7 @@ export USER_ID_HEADER="X-User-Id"
 export AUTH_METHOD_HEADER="X-Auth-Method"
 
 # Socket
-export AGENT_SOCKET="/var/run/sentinel/auth.sock"
+export AGENT_SOCKET="/var/run/zentinel/auth.sock"
 ```
 
 ## Headers Added to Requests

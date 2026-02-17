@@ -8,7 +8,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/sentinel-auth
+  IMAGE_NAME: ${{ github.repository_owner }}/zentinel-auth
 
 jobs:
   publish:
@@ -42,17 +42,17 @@ jobs:
       - name: Build release binary
         run: |
           cargo build --release
-          strip target/release/sentinel-auth-agent
+          strip target/release/zentinel-auth-agent
 
       - name: Prepare artifacts
         run: |
           mkdir -p artifacts
-          cp target/release/sentinel-auth-agent artifacts/
+          cp target/release/zentinel-auth-agent artifacts/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: sentinel-auth-linux-amd64
+          name: zentinel-auth-linux-amd64
           path: artifacts/
           retention-days: 7
 
@@ -69,11 +69,11 @@ jobs:
       - name: Download AMD64 artifact
         uses: actions/download-artifact@v4
         with:
-          name: sentinel-auth-linux-amd64
+          name: zentinel-auth-linux-amd64
           path: artifacts/linux-amd64
 
       - name: Prepare artifact
-        run: chmod +x artifacts/linux-amd64/sentinel-auth-agent
+        run: chmod +x artifacts/linux-amd64/zentinel-auth-agent
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -114,13 +114,13 @@ jobs:
       - name: Download AMD64 artifact
         uses: actions/download-artifact@v4
         with:
-          name: sentinel-auth-linux-amd64
+          name: zentinel-auth-linux-amd64
           path: artifacts/linux-amd64
 
       - name: Prepare release files
         run: |
           mkdir -p release
-          mv artifacts/linux-amd64/sentinel-auth-agent release/sentinel-auth-agent-linux-amd64
+          mv artifacts/linux-amd64/zentinel-auth-agent release/zentinel-auth-agent-linux-amd64
 
       - name: Create release
         uses: softprops/action-gh-release@v1

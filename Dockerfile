@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 
-# Sentinel Auth Agent Container Image
+# Zentinel Auth Agent Container Image
 #
 # Targets:
 #   - auth-agent (default): Distroless production image
@@ -36,7 +36,7 @@ COPY src/ src/
 
 # Build release binary with full optimizations
 RUN cargo build --release && \
-    strip target/release/sentinel-auth-agent
+    strip target/release/zentinel-auth-agent
 
 ################################################################################
 # Production image: Distroless (smallest, most secure)
@@ -44,36 +44,36 @@ RUN cargo build --release && \
 FROM gcr.io/distroless/cc-debian12:nonroot AS auth-agent
 
 # Copy the binary
-COPY --from=builder /app/target/release/sentinel-auth-agent /sentinel-auth-agent
+COPY --from=builder /app/target/release/zentinel-auth-agent /zentinel-auth-agent
 
 # Labels for container metadata
-LABEL org.opencontainers.image.title="Sentinel Auth Agent" \
-      org.opencontainers.image.description="Authentication agent for Sentinel reverse proxy" \
+LABEL org.opencontainers.image.title="Zentinel Auth Agent" \
+      org.opencontainers.image.description="Authentication agent for Zentinel reverse proxy" \
       org.opencontainers.image.vendor="Raskell" \
-      org.opencontainers.image.source="https://github.com/raskell-io/sentinel-agent-auth"
+      org.opencontainers.image.source="https://github.com/zentinelproxy/zentinel-agent-auth"
 
 # Environment variables
-ENV RUST_LOG=info,sentinel_auth_agent=debug \
-    SOCKET_PATH=/var/run/sentinel/auth.sock
+ENV RUST_LOG=info,zentinel_auth_agent=debug \
+    SOCKET_PATH=/var/run/zentinel/auth.sock
 
 # Run as non-root user
 USER nonroot:nonroot
 
-CMD ["/sentinel-auth-agent"]
+CMD ["/zentinel-auth-agent"]
 
 ################################################################################
 # Pre-built binary stage (for CI multi-arch builds)
 ################################################################################
 FROM gcr.io/distroless/cc-debian12:nonroot AS auth-agent-prebuilt
 
-COPY sentinel-auth-agent /sentinel-auth-agent
+COPY zentinel-auth-agent /zentinel-auth-agent
 
-LABEL org.opencontainers.image.title="Sentinel Auth Agent" \
-      org.opencontainers.image.description="Authentication agent for Sentinel reverse proxy"
+LABEL org.opencontainers.image.title="Zentinel Auth Agent" \
+      org.opencontainers.image.description="Authentication agent for Zentinel reverse proxy"
 
-ENV RUST_LOG=info,sentinel_auth_agent=debug \
-    SOCKET_PATH=/var/run/sentinel/auth.sock
+ENV RUST_LOG=info,zentinel_auth_agent=debug \
+    SOCKET_PATH=/var/run/zentinel/auth.sock
 
 USER nonroot:nonroot
 
-ENTRYPOINT ["/sentinel-auth-agent"]
+ENTRYPOINT ["/zentinel-auth-agent"]

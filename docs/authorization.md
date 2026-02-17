@@ -44,7 +44,7 @@ agents {
         config {
             authz {
                 enabled true
-                policy-file "/etc/sentinel/policies/auth.cedar"
+                policy-file "/etc/zentinel/policies/auth.cedar"
                 default-decision "deny"
             }
         }
@@ -58,7 +58,7 @@ agents {
 {
   "authz": {
     "enabled": true,
-    "policy-file": "/etc/sentinel/policies/auth.cedar",
+    "policy-file": "/etc/zentinel/policies/auth.cedar",
     "default-decision": "deny",
     "principal-claim": "sub",
     "roles-claim": "roles"
@@ -258,7 +258,7 @@ forbid(
 ## Complete Policy Example
 
 ```cedar
-// /etc/sentinel/policies/auth.cedar
+// /etc/zentinel/policies/auth.cedar
 
 // ===================
 // Public Endpoints
@@ -350,7 +350,7 @@ Response: `403 Forbidden`
 Enable verbose logging to see policy evaluation:
 
 ```bash
-RUST_LOG=debug sentinel-auth-agent ...
+RUST_LOG=debug zentinel-auth-agent ...
 ```
 
 Log output shows:

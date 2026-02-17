@@ -1,6 +1,6 @@
-# sentinel-agent-auth
+# zentinel-agent-auth
 
-Authentication and authorization agent for [Sentinel](https://github.com/raskell-io/sentinel) reverse proxy. Supports JWT/Bearer tokens, OIDC/OAuth 2.0, API keys, Basic authentication, SAML SSO, and mTLS client certificates.
+Authentication and authorization agent for [Zentinel](https://github.com/zentinelproxy/zentinel) reverse proxy. Supports JWT/Bearer tokens, OIDC/OAuth 2.0, API keys, Basic authentication, SAML SSO, and mTLS client certificates.
 
 ## Features
 
@@ -38,21 +38,21 @@ Authentication and authorization agent for [Sentinel](https://github.com/raskell
 ### From crates.io
 
 ```bash
-cargo install sentinel-agent-auth
+cargo install zentinel-agent-auth
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/raskell-io/sentinel-agent-auth
-cd sentinel-agent-auth
+git clone https://github.com/zentinelproxy/zentinel-agent-auth
+cd zentinel-agent-auth
 cargo build --release
 ```
 
 ## Usage
 
 ```bash
-sentinel-auth-agent --socket /var/run/sentinel/auth.sock \
+zentinel-auth-agent --socket /var/run/zentinel/auth.sock \
   --jwt-secret "your-secret-key" \
   --api-keys "key1:app1,key2:app2"
 ```
@@ -61,7 +61,7 @@ sentinel-auth-agent --socket /var/run/sentinel/auth.sock \
 
 | Option | Environment Variable | Description | Default |
 |--------|---------------------|-------------|---------|
-| `--socket` | `AGENT_SOCKET` | Unix socket path | `/tmp/sentinel-auth.sock` |
+| `--socket` | `AGENT_SOCKET` | Unix socket path | `/tmp/zentinel-auth.sock` |
 | `--jwt-secret` | `JWT_SECRET` | JWT secret key (for HS256) | - |
 | `--jwt-public-key` | `JWT_PUBLIC_KEY` | JWT public key file (for RS/ES) | - |
 | `--jwt-algorithm` | `JWT_ALGORITHM` | JWT algorithm | `HS256` |
@@ -83,13 +83,13 @@ See [Configuration Reference](docs/configuration.md) for OIDC, mTLS, Cedar autho
 
 ```bash
 # Configure with HS256 secret
-sentinel-auth-agent --jwt-secret "your-32-char-minimum-secret-key"
+zentinel-auth-agent --jwt-secret "your-32-char-minimum-secret-key"
 
 # Configure with RS256 public key
-sentinel-auth-agent --jwt-algorithm RS256 --jwt-public-key /path/to/public.pem
+zentinel-auth-agent --jwt-algorithm RS256 --jwt-public-key /path/to/public.pem
 
 # With issuer and audience validation
-sentinel-auth-agent \
+zentinel-auth-agent \
   --jwt-secret "secret" \
   --jwt-issuer "https://auth.example.com" \
   --jwt-audience "my-api"
@@ -104,7 +104,7 @@ curl -H "Authorization: Bearer eyJ..." http://localhost:8080/api
 
 ```bash
 # Configure API keys
-sentinel-auth-agent --api-keys "sk_live_abc123:production,sk_test_xyz:development"
+zentinel-auth-agent --api-keys "sk_live_abc123:production,sk_test_xyz:development"
 ```
 
 Client request:
@@ -116,7 +116,7 @@ curl -H "X-API-Key: sk_live_abc123" http://localhost:8080/api
 
 ```bash
 # Configure users
-sentinel-auth-agent --basic-auth-users "admin:secretpass,user:userpass"
+zentinel-auth-agent --basic-auth-users "admin:secretpass,user:userpass"
 ```
 
 Client request:
@@ -147,7 +147,7 @@ curl -H "Authorization: Bearer <oauth2-access-token>" http://localhost:8080/api
 
 ### mTLS Client Certificates
 
-Authenticate clients using X.509 certificates (requires Sentinel proxy to forward client cert):
+Authenticate clients using X.509 certificates (requires Zentinel proxy to forward client cert):
 
 ```kdl
 config {
@@ -160,7 +160,7 @@ config {
 }
 ```
 
-The Sentinel proxy forwards the client certificate in a header after TLS termination.
+The Zentinel proxy forwards the client certificate in a header after TLS termination.
 
 ## Authorization
 
@@ -170,7 +170,7 @@ After authentication, requests can be authorized using Cedar policies:
 config {
     authz {
         enabled true
-        policy-file "/etc/sentinel/policies/auth.cedar"
+        policy-file "/etc/zentinel/policies/auth.cedar"
         default-decision "deny"
     }
 }
@@ -210,14 +210,14 @@ On successful authentication, the agent adds these headers to the request:
 
 ## Configuration
 
-### Sentinel Proxy Configuration
+### Zentinel Proxy Configuration
 
 ```kdl
 agents {
     agent "auth" {
         type "custom"
         transport "unix_socket" {
-            path "/var/run/sentinel/auth.sock"
+            path "/var/run/zentinel/auth.sock"
         }
         events ["request_headers"]
         timeout-ms 50
@@ -251,7 +251,7 @@ FAIL_OPEN: "false"
 | 401 | No valid credentials provided |
 | (passthrough) | Credentials valid, request forwarded |
 
-The agent adds `WWW-Authenticate: Bearer realm="sentinel"` header on 401 responses.
+The agent adds `WWW-Authenticate: Bearer realm="zentinel"` header on 401 responses.
 
 ## Development
 

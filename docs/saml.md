@@ -1,6 +1,6 @@
 # SAML Authentication
 
-This guide covers SAML 2.0 Single Sign-On (SSO) configuration for the Sentinel Auth Agent.
+This guide covers SAML 2.0 Single Sign-On (SSO) configuration for the Zentinel Auth Agent.
 
 ## Overview
 
@@ -20,7 +20,7 @@ The agent acts as a SAML Service Provider (SP), supporting SP-initiated SSO with
 
 ```
 ┌────────┐     ┌─────────┐     ┌──────────┐     ┌─────┐
-│ Client │     │ Sentinel│     │Auth Agent│     │ IdP │
+│ Client │     │ Zentinel│     │Auth Agent│     │ IdP │
 └───┬────┘     └────┬────┘     └────┬─────┘     └──┬──┘
     │               │               │              │
     │ GET /app      │               │              │
@@ -100,8 +100,8 @@ The agent acts as a SAML Service Provider (SP), supporting SP-initiated SSO with
 | `certificate-pem` | string | - | SP certificate for metadata |
 | **Session Settings** |
 | `session-ttl-secs` | int | `28800` | Session lifetime (default 8 hours) |
-| `session-cookie-name` | string | `sentinel_saml_session` | Cookie name |
-| `session-store-path` | string | `/var/lib/sentinel-auth/sessions.redb` | Database path |
+| `session-cookie-name` | string | `zentinel_saml_session` | Cookie name |
+| `session-store-path` | string | `/var/lib/zentinel-auth/sessions.redb` | Database path |
 | `cleanup-interval-secs` | int | `300` | Expired session cleanup interval |
 | **Cookie Settings** |
 | `cookie-domain` | string | - | Cookie domain (defaults to request host) |
@@ -284,7 +284,7 @@ The session cookie is set with security best practices:
 
 Example cookie:
 ```
-Set-Cookie: sentinel_saml_session=a1b2c3d4e5f6...; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=28800
+Set-Cookie: zentinel_saml_session=a1b2c3d4e5f6...; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=28800
 ```
 
 ## Security Considerations
@@ -333,10 +333,10 @@ The `clock-skew-secs` setting (default 5 minutes) allows for time differences be
 Enable verbose logging:
 
 ```bash
-RUST_LOG=debug sentinel-auth-agent ...
+RUST_LOG=debug zentinel-auth-agent ...
 ```
 
-Or via Sentinel config:
+Or via Zentinel config:
 ```kdl
 agent "auth" {
     config {

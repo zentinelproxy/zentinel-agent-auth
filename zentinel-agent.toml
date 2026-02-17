@@ -1,0 +1,24 @@
+# Zentinel Agent Registry Manifest
+# Auth Agent - JWT, API key, and Basic authentication
+
+[agent]
+name = "zentinel-agent-auth"
+version = "0.1.0"
+description = "Authentication agent for Zentinel reverse proxy - JWT, API keys, and Basic auth"
+authors = ["Zentinel Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zentinelproxy/zentinel-agent-auth"
+
+[protocol]
+version = "0.1"
+events = ["request_headers"]
+
+[compatibility]
+zentinel-proxy = ">=0.1.0"
+zentinel-agent-protocol = "0.1"
+
+[registry]
+homepage = "https://zentinelproxy.io/agents/auth"
+documentation = "https://zentinelproxy.io/docs/agents/auth"
+keywords = ["zentinel", "agent", "authentication", "jwt", "api-key"]
+categories = ["authentication", "security"]

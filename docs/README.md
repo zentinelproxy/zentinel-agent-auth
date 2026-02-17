@@ -1,6 +1,6 @@
-# Sentinel Auth Agent Documentation
+# Zentinel Auth Agent Documentation
 
-This directory contains documentation for the Sentinel Authentication and Authorization Agent.
+This directory contains documentation for the Zentinel Authentication and Authorization Agent.
 
 ## Contents
 
@@ -17,8 +17,8 @@ This directory contains documentation for the Sentinel Authentication and Author
 ## Quick Links
 
 - [Main README](../README.md) - Installation and basic usage
-- [GitHub Repository](https://github.com/raskell-io/sentinel-agent-auth)
-- [Sentinel Proxy](https://github.com/raskell-io/sentinel)
+- [GitHub Repository](https://github.com/zentinelproxy/zentinel-agent-auth)
+- [Zentinel Proxy](https://github.com/zentinelproxy/zentinel)
 
 ## Authentication Methods
 
@@ -46,7 +46,7 @@ The agent supports policy-based authorization using the Cedar Policy Engine:
 
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌──────────────┐
-│   Client    │────▶│  Sentinel Proxy  │────▶│   Upstream   │
+│   Client    │────▶│  Zentinel Proxy  │────▶│   Upstream   │
 └─────────────┘     └────────┬─────────┘     └──────────────┘
                              │
                              ▼
@@ -77,7 +77,7 @@ The agent supports policy-based authorization using the Cedar Policy Engine:
 ### JWT/API Key/Basic Auth
 
 1. Client sends request with credentials (Authorization header or API key)
-2. Sentinel forwards request headers to auth agent
+2. Zentinel forwards request headers to auth agent
 3. Agent validates credentials
 4. On success: adds identity headers, allows request
 5. On failure: returns 401 Unauthorized
@@ -104,7 +104,7 @@ The agent supports policy-based authorization using the Cedar Policy Engine:
 ### mTLS Client Certificates
 
 1. Client connects with TLS client certificate
-2. Sentinel proxy terminates TLS, extracts certificate
+2. Zentinel proxy terminates TLS, extracts certificate
 3. Proxy forwards certificate in `X-Client-Cert` header
 4. Agent parses certificate, checks DN/SAN allowlists
 5. On success: adds identity headers (CN as user ID), allows request
@@ -123,4 +123,4 @@ After authentication:
 
 - Check the [configuration reference](configuration.md) for all options
 - See [SAML guide](saml.md) for IdP-specific setup
-- File issues at [GitHub Issues](https://github.com/raskell-io/sentinel-agent-auth/issues)
+- File issues at [GitHub Issues](https://github.com/zentinelproxy/zentinel-agent-auth/issues)

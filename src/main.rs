@@ -1,6 +1,6 @@
-//! Sentinel Authentication Agent
+//! Zentinel Authentication Agent
 //!
-//! This agent provides authentication for the Sentinel proxy,
+//! This agent provides authentication for the Zentinel proxy,
 //! supporting JWT/Bearer tokens, API keys, Basic auth, SAML SSO,
 //! OIDC/OAuth 2.0, mTLS client certificates, and Cedar policy authorization.
 
@@ -21,15 +21,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use sentinel_agent_protocol::{
+use zentinel_agent_protocol::{
     AgentResponse, AuditMetadata, HeaderOp,
     RequestBodyChunkEvent, RequestHeadersEvent, ResponseHeadersEvent,
 };
-use sentinel_agent_protocol::v2::{
+use zentinel_agent_protocol::v2::{
     AgentCapabilities, AgentFeatures, AgentHandlerV2, CounterMetric, DrainReason,
     GrpcAgentServerV2, HealthStatus, MetricsReport, ShutdownReason,
 };
-use sentinel_agent_protocol::EventType;
+use zentinel_agent_protocol::EventType;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -45,11 +45,11 @@ use session::{spawn_cleanup_task, SessionId, SessionStore, DEFAULT_CLEANUP_INTER
 
 /// Command line arguments
 #[derive(Parser, Debug)]
-#[command(name = "sentinel-auth-agent")]
-#[command(about = "Authentication agent for Sentinel reverse proxy")]
+#[command(name = "zentinel-auth-agent")]
+#[command(about = "Authentication agent for Zentinel reverse proxy")]
 struct Args {
     /// Path to Unix socket (for UDS transport)
-    #[arg(long, default_value = "/tmp/sentinel-auth.sock", env = "AGENT_SOCKET")]
+    #[arg(long, default_value = "/tmp/zentinel-auth.sock", env = "AGENT_SOCKET")]
     socket: PathBuf,
 
     /// gRPC server address (e.g., "[::1]:50051" or "0.0.0.0:50051")
@@ -1197,8 +1197,8 @@ impl AgentHandlerV2 for AuthAgent {
     /// Get agent capabilities for v2 protocol.
     fn capabilities(&self) -> AgentCapabilities {
         AgentCapabilities::new(
-            "sentinel-auth-agent",
-            "Sentinel Auth Agent",
+            "zentinel-auth-agent",
+            "Zentinel Auth Agent",
             env!("CARGO_PKG_VERSION"),
         )
         .with_event(EventType::RequestHeaders)
@@ -1225,10 +1225,10 @@ impl AgentHandlerV2 for AuthAgent {
             .unwrap_or(false);
 
         if is_healthy {
-            HealthStatus::healthy("sentinel-auth-agent")
+            HealthStatus::healthy("zentinel-auth-agent")
         } else {
             HealthStatus::degraded(
-                "sentinel-auth-agent",
+                "zentinel-auth-agent",
                 vec!["config_error".to_string()],
                 1.5, // Increase timeout multiplier when degraded
             )
@@ -1237,7 +1237,7 @@ impl AgentHandlerV2 for AuthAgent {
 
     /// Get current metrics report.
     fn metrics_report(&self) -> Option<MetricsReport> {
-        let mut report = MetricsReport::new("sentinel-auth-agent", 10_000);
+        let mut report = MetricsReport::new("zentinel-auth-agent", 10_000);
 
         report.counters.push(CounterMetric::new(
             "auth_requests_total",
@@ -1461,7 +1461,7 @@ impl AgentHandlerV2 for AuthAgent {
                     AgentResponse::block(401, Some("Unauthorized".to_string()))
                         .add_response_header(HeaderOp::Set {
                             name: "WWW-Authenticate".to_string(),
-                            value: "Bearer realm=\"sentinel\"".to_string(),
+                            value: "Bearer realm=\"zentinel\"".to_string(),
                         })
                         .with_audit(AuditMetadata {
                             tags: vec!["auth".to_string(), "blocked".to_string()],
@@ -1641,11 +1641,11 @@ async fn main() -> Result<()> {
     // Initialize tracing
     let log_level = if args.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
-        .with_env_filter(format!("{}={},sentinel_agent_protocol=info", env!("CARGO_CRATE_NAME"), log_level))
+        .with_env_filter(format!("{}={},zentinel_agent_protocol=info", env!("CARGO_CRATE_NAME"), log_level))
         .json()
         .init();
 
-    info!("Starting Sentinel Auth Agent");
+    info!("Starting Zentinel Auth Agent");
 
     // Build configuration
     let config = AuthConfig::from_args(&args)?;
@@ -1661,7 +1661,7 @@ async fn main() -> Result<()> {
     // Initialize session store for SAML (will be configured via on_configure)
     // Use a default path, can be overridden via SAML config
     let session_store_path = std::env::var("SAML_SESSION_STORE_PATH")
-        .unwrap_or_else(|_| "/var/lib/sentinel-auth/sessions.redb".to_string());
+        .unwrap_or_else(|_| "/var/lib/zentinel-auth/sessions.redb".to_string());
 
     let session_store = match SessionStore::open(
         PathBuf::from(&session_store_path),
@@ -1702,7 +1702,7 @@ async fn main() -> Result<()> {
             "Starting auth agent with gRPC v2 transport"
         );
 
-        let server = GrpcAgentServerV2::new("sentinel-auth-agent", Box::new(agent));
+        let server = GrpcAgentServerV2::new("zentinel-auth-agent", Box::new(agent));
         server.run(addr).await.map_err(|e| anyhow::anyhow!("{}", e))?;
     } else {
         // Use UDS transport (v1 fallback for now, as v2 UDS server is client-side only)
@@ -1714,14 +1714,14 @@ async fn main() -> Result<()> {
 
         // For UDS, we need to use the v1 server since v2 UDS is primarily client-side
         // The v2 protocol is fully supported over gRPC
-        use sentinel_agent_protocol::{AgentServer, AgentHandler};
+        use zentinel_agent_protocol::{AgentServer, AgentHandler};
 
         // Create a v1-compatible wrapper
         struct V1Wrapper(AuthAgent);
 
         #[async_trait::async_trait]
         impl AgentHandler for V1Wrapper {
-            async fn on_configure(&self, event: sentinel_agent_protocol::ConfigureEvent) -> AgentResponse {
+            async fn on_configure(&self, event: zentinel_agent_protocol::ConfigureEvent) -> AgentResponse {
                 // Forward to v2 handler
                 let success = self.0.on_configure(event.config, None).await;
                 if success {
@@ -1746,7 +1746,7 @@ async fn main() -> Result<()> {
 
         let wrapped_agent = V1Wrapper(agent);
         let server = AgentServer::new(
-            "sentinel-auth-agent",
+            "zentinel-auth-agent",
             args.socket,
             Box::new(wrapped_agent),
         );

@@ -42,7 +42,7 @@ Sessions are persisted using [redb](https://github.com/cberner/redb), a lightwei
 
 ### File Location
 
-Default path: `/var/lib/sentinel-auth/sessions.redb`
+Default path: `/var/lib/zentinel-auth/sessions.redb`
 
 Configure via:
 ```json
@@ -60,8 +60,8 @@ The agent creates the parent directory if it doesn't exist.
 The database file should be readable/writable only by the agent process:
 
 ```bash
-chmod 600 /var/lib/sentinel-auth/sessions.redb
-chown sentinel:sentinel /var/lib/sentinel-auth/sessions.redb
+chmod 600 /var/lib/zentinel-auth/sessions.redb
+chown zentinel:zentinel /var/lib/zentinel-auth/sessions.redb
 ```
 
 ## Session Lifecycle
@@ -228,7 +228,7 @@ Session cleanup: evicted 15 expired sessions
 Monitor database file size:
 
 ```bash
-ls -lh /var/lib/sentinel-auth/sessions.redb
+ls -lh /var/lib/zentinel-auth/sessions.redb
 ```
 
 Typical size: ~1KB per active session
@@ -248,7 +248,7 @@ To backup sessions:
 
 ```bash
 # Stop agent or ensure no writes
-cp /var/lib/sentinel-auth/sessions.redb /backup/sessions.redb.bak
+cp /var/lib/zentinel-auth/sessions.redb /backup/sessions.redb.bak
 ```
 
 ### Recovery
@@ -257,7 +257,7 @@ To restore:
 
 ```bash
 # Stop agent
-cp /backup/sessions.redb.bak /var/lib/sentinel-auth/sessions.redb
+cp /backup/sessions.redb.bak /var/lib/zentinel-auth/sessions.redb
 # Start agent
 ```
 
@@ -267,7 +267,7 @@ To clear all sessions:
 
 ```bash
 # Stop agent
-rm /var/lib/sentinel-auth/sessions.redb
+rm /var/lib/zentinel-auth/sessions.redb
 # Start agent (creates fresh database)
 ```
 
@@ -298,7 +298,7 @@ If the database becomes corrupted:
 
 ```bash
 # Stop agent
-rm /var/lib/sentinel-auth/sessions.redb
+rm /var/lib/zentinel-auth/sessions.redb
 # Start agent (users will need to re-authenticate)
 ```
 

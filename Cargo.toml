@@ -1,26 +1,26 @@
 [package]
-name = "sentinel-agent-auth"
+name = "zentinel-agent-auth"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
-authors = ["Sentinel Contributors"]
+authors = ["Zentinel Contributors"]
 license = "Apache-2.0"
-repository = "https://github.com/raskell-io/sentinel-agent-auth"
-homepage = "https://sentinel.raskell.io"
-documentation = "https://sentinel.raskell.io/docs/agents/auth"
-description = "Authentication agent for Sentinel reverse proxy - JWT, API keys, and Basic auth"
+repository = "https://github.com/zentinelproxy/zentinel-agent-auth"
+homepage = "https://zentinelproxy.io"
+documentation = "https://zentinelproxy.io/docs/agents/auth"
+description = "Authentication agent for Zentinel reverse proxy - JWT, API keys, and Basic auth"
 keywords = ["proxy", "reverse-proxy", "agent", "authentication", "jwt"]
 categories = ["network-programming", "authentication"]
 readme = "README.md"
 
 [[bin]]
-name = "sentinel-auth-agent"
+name = "zentinel-auth-agent"
 path = "src/main.rs"
 
 [dependencies]
-# Sentinel protocol
-sentinel-agent-protocol = "0.3"
-sentinel-common = "0.1"
+# Zentinel protocol
+zentinel-agent-protocol = "0.3"
+zentinel-common = "0.1"
 
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }

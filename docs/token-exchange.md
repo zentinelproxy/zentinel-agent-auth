@@ -59,7 +59,7 @@ agents {
                 enabled true
                 endpoint-path "/token/exchange"
                 issuer "https://auth.internal.example.com"
-                signing-key-file "/etc/sentinel/jwt-private.pem"
+                signing-key-file "/etc/zentinel/jwt-private.pem"
                 signing-algorithm "RS256"
             }
         }
@@ -75,7 +75,7 @@ agents {
     "enabled": true,
     "endpoint-path": "/token/exchange",
     "issuer": "https://auth.internal.example.com",
-    "signing-key-file": "/etc/sentinel/jwt-private.pem",
+    "signing-key-file": "/etc/zentinel/jwt-private.pem",
     "signing-algorithm": "RS256",
     "default-audience": "internal-api",
     "token-ttl-secs": 3600,
@@ -261,7 +261,7 @@ Configure:
 ```json
 {
   "token-exchange": {
-    "signing-key-file": "/etc/sentinel/jwt-private.pem",
+    "signing-key-file": "/etc/zentinel/jwt-private.pem",
     "signing-algorithm": "RS256"
   }
 }
@@ -284,7 +284,7 @@ Configure:
 ```json
 {
   "token-exchange": {
-    "signing-key-file": "/etc/sentinel/jwt-private.pem",
+    "signing-key-file": "/etc/zentinel/jwt-private.pem",
     "signing-algorithm": "ES256"
   }
 }

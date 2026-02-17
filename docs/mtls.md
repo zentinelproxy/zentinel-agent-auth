@@ -4,7 +4,7 @@ The auth agent supports mutual TLS (mTLS) authentication using X.509 client cert
 
 ## Overview
 
-In mTLS authentication, the Sentinel proxy handles TLS termination and forwards the client certificate to the auth agent in a header. The agent validates the certificate and extracts identity information.
+In mTLS authentication, the Zentinel proxy handles TLS termination and forwards the client certificate to the auth agent in a header. The agent validates the certificate and extracts identity information.
 
 ## How It Works
 
@@ -13,7 +13,7 @@ Client with TLS certificate
          │
          ▼
 ┌─────────────────────┐
-│ Sentinel Proxy      │
+│ Zentinel Proxy      │
 │ TLS termination     │
 │ Extract client cert │
 └─────────┬───────────┘
@@ -42,9 +42,9 @@ Client with TLS certificate
 
 ## Configuration
 
-### Sentinel Proxy Configuration
+### Zentinel Proxy Configuration
 
-First, configure Sentinel to require client certificates and forward them:
+First, configure Zentinel to require client certificates and forward them:
 
 ```kdl
 listener {
@@ -296,7 +296,7 @@ openssl x509 -req -days 365 -in service.csr -CA ca.crt -CAkey ca.key \
 
 If you see "No client certificate in request":
 
-1. Verify Sentinel is configured to forward the certificate header
+1. Verify Zentinel is configured to forward the certificate header
 2. Check the header name matches (`X-Client-Cert` by default)
 3. Verify the client is sending a certificate
 

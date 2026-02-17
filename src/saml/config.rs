@@ -131,7 +131,7 @@ fn default_session_ttl() -> u64 {
 }
 
 fn default_cookie_name() -> String {
-    "sentinel_saml_session".to_string()
+    "zentinel_saml_session".to_string()
 }
 
 fn default_cookie_path() -> String {
@@ -151,7 +151,7 @@ fn default_clock_skew() -> i64 {
 }
 
 fn default_session_store_path() -> String {
-    "/var/lib/sentinel-auth/sessions.redb".to_string()
+    "/var/lib/zentinel-auth/sessions.redb".to_string()
 }
 
 fn default_cleanup_interval() -> u64 {
@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn test_cookie_parsing() {
         let config = SamlConfig::default();
-        let cookie = "other=value; sentinel_saml_session=abc123def456; another=test";
+        let cookie = "other=value; zentinel_saml_session=abc123def456; another=test";
         assert_eq!(
             config.parse_session_cookie(cookie),
             Some("abc123def456".to_string())
@@ -484,7 +484,7 @@ mod tests {
         config.cookie_domain = Some("example.com".to_string());
 
         let cookie = config.build_cookie("session123");
-        assert!(cookie.contains("sentinel_saml_session=session123"));
+        assert!(cookie.contains("zentinel_saml_session=session123"));
         assert!(cookie.contains("Domain=example.com"));
         assert!(cookie.contains("Path=/"));
         assert!(cookie.contains("Secure"));
