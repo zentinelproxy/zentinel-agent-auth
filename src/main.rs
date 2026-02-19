@@ -9,6 +9,7 @@ mod exchange;
 mod mtls;
 mod oidc;
 mod saml;
+mod scim;
 mod session;
 
 use anyhow::{anyhow, Context, Result};
@@ -41,6 +42,10 @@ use exchange::{
 use mtls::{validate_client_cert, MtlsConfig, MtlsConfigJson};
 use oidc::{validate_oidc_token, JwksCache, OidcConfig, OidcConfigJson};
 use saml::{SamlConfig, SamlConfigJson, SamlProvider};
+use scim::{
+    handle_scim_body, handle_scim_delete, handle_scim_get, match_scim_route, scim_error_response,
+    ScimConfig, ScimConfigJson, ScimRoute, ScimUserStore,
+};
 use session::{spawn_cleanup_task, SessionId, SessionStore, DEFAULT_CLEANUP_INTERVAL_SECS};
 
 /// Command line arguments
@@ -224,6 +229,9 @@ pub struct AuthConfigJson {
     /// Token exchange configuration
     #[serde(default)]
     pub token_exchange: TokenExchangeConfigJson,
+    /// SCIM provisioning configuration
+    #[serde(default)]
+    pub scim: ScimConfigJson,
 }
 
 impl AuthConfig {
@@ -328,8 +336,14 @@ pub struct AuthAgent {
     exchange_config: RwLock<TokenExchangeConfig>,
     /// Token issuer (initialized when exchange is enabled).
     token_issuer: RwLock<Option<TokenIssuer>>,
+    /// SCIM provisioning configuration.
+    scim_config: RwLock<ScimConfig>,
+    /// SCIM user store (initialized when SCIM is enabled).
+    scim_store: Option<Arc<ScimUserStore>>,
     /// Metrics: total requests processed.
     requests_total: AtomicU64,
+    /// Metrics: SCIM provisioning requests.
+    scim_requests_total: AtomicU64,
     /// Metrics: successful authentications.
     auth_success_total: AtomicU64,
     /// Metrics: failed authentications.
@@ -341,7 +355,11 @@ pub struct AuthAgent {
 }
 
 impl AuthAgent {
-    pub fn new(config: AuthConfig, session_store: Option<Arc<SessionStore>>) -> Self {
+    pub fn new(
+        config: AuthConfig,
+        session_store: Option<Arc<SessionStore>>,
+        scim_store: Option<Arc<ScimUserStore>>,
+    ) -> Self {
         Self {
             config: RwLock::new(config),
             saml_provider: RwLock::new(None),
@@ -355,7 +373,10 @@ impl AuthAgent {
             authorizer: RwLock::new(None),
             exchange_config: RwLock::new(TokenExchangeConfig::default()),
             token_issuer: RwLock::new(None),
+            scim_config: RwLock::new(ScimConfig::default()),
+            scim_store,
             requests_total: AtomicU64::new(0),
+            scim_requests_total: AtomicU64::new(0),
             auth_success_total: AtomicU64::new(0),
             auth_failure_total: AtomicU64::new(0),
             blocked_total: AtomicU64::new(0),
@@ -477,6 +498,47 @@ impl AuthAgent {
         self.exchange_config.read()
             .map(|c| c.clone())
             .map_err(|_| anyhow!("Exchange config lock poisoned"))
+    }
+
+    /// Configure SCIM provisioning.
+    pub fn configure_scim(&self, config: ScimConfig) -> Result<()> {
+        if config.enabled {
+            if let Err(e) = config.validate() {
+                return Err(anyhow!("SCIM config validation failed: {}", e));
+            }
+            info!(base_path = %config.base_path, "SCIM provisioning configured");
+        }
+
+        let mut scim_cfg = self.scim_config.write()
+            .map_err(|_| anyhow!("SCIM config lock poisoned"))?;
+        *scim_cfg = config;
+
+        Ok(())
+    }
+
+    /// Get SCIM config.
+    fn get_scim_config(&self) -> Result<ScimConfig> {
+        self.scim_config.read()
+            .map(|c| c.clone())
+            .map_err(|_| anyhow!("SCIM config lock poisoned"))
+    }
+
+    /// Validate a SCIM bearer token against the configured static token.
+    fn validate_scim_bearer_token(&self, auth_header: &str) -> Result<()> {
+        let token = if auth_header.starts_with("Bearer ") || auth_header.starts_with("bearer ") {
+            &auth_header[7..]
+        } else {
+            return Err(anyhow!("Missing Bearer prefix"));
+        };
+
+        let scim_config = self.get_scim_config()?;
+        if let Some(ref expected) = scim_config.bearer_token {
+            if token == expected {
+                return Ok(());
+            }
+        }
+
+        Err(anyhow!("Invalid SCIM bearer token"))
     }
 
     /// Try to authenticate via mTLS client certificate.
@@ -1003,6 +1065,11 @@ impl AuthAgent {
         json_config.token_exchange.apply_to(&mut exchange_config);
         self.configure_exchange(exchange_config)?;
 
+        // Update SCIM config
+        let mut scim_config = self.get_scim_config().unwrap_or_default();
+        json_config.scim.apply_to(&mut scim_config);
+        self.configure_scim(scim_config)?;
+
         info!("Reconfigured auth agent");
         Ok(())
     }
@@ -1255,6 +1322,10 @@ impl AgentHandlerV2 for AuthAgent {
             "auth_blocked_total",
             self.blocked_total.load(Ordering::Relaxed),
         ));
+        report.counters.push(CounterMetric::new(
+            "scim_requests_total",
+            self.scim_requests_total.load(Ordering::Relaxed),
+        ));
 
         Some(report)
     }
@@ -1352,6 +1423,74 @@ impl AgentHandlerV2 for AuthAgent {
             .map(|s| s.to_uppercase())
             .unwrap_or_default();
 
+        // Check if this is a SCIM provisioning endpoint
+        let scim_config = self.get_scim_config().unwrap_or_default();
+        if scim_config.enabled && scim_config.matches_path(request_path) {
+            self.scim_requests_total.fetch_add(1, Ordering::Relaxed);
+
+            // Authenticate the SCIM request (bearer token or OIDC)
+            let auth_header = event.headers.iter()
+                .find(|(k, _)| k.to_lowercase() == "authorization")
+                .and_then(|(_, v)| v.first())
+                .cloned();
+
+            let scim_authed = match auth_header {
+                Some(ref header) => {
+                    // Try static bearer token first
+                    if self.validate_scim_bearer_token(header).is_ok() {
+                        true
+                    } else if scim_config.use_oidc_auth {
+                        // Try OIDC validation
+                        let token = if header.starts_with("Bearer ") || header.starts_with("bearer ") {
+                            &header[7..]
+                        } else {
+                            ""
+                        };
+                        self.authenticate_oidc(token).await.is_ok()
+                    } else {
+                        false
+                    }
+                }
+                None => false,
+            };
+
+            if !scim_authed {
+                return scim_error_response(401, "Unauthorized");
+            }
+
+            // Route the request
+            if let Some(route) = match_scim_route(&scim_config.base_path, request_path, &request_method) {
+                let scim_store = match &self.scim_store {
+                    Some(s) => s,
+                    None => return scim_error_response(503, "SCIM store not initialized"),
+                };
+
+                let base_url = scim_config.effective_base_url();
+
+                match &route {
+                    // GET and DELETE can be handled immediately (no body needed)
+                    ScimRoute::GetUser(_) | ScimRoute::ListUsers => {
+                        let query_string = request_path.split('?').nth(1);
+                        return handle_scim_get(scim_store, &route, query_string, &base_url);
+                    }
+                    ScimRoute::DeleteUser(id) => {
+                        return handle_scim_delete(scim_store, id);
+                    }
+                    // POST, PUT, PATCH need body buffering
+                    ScimRoute::CreateUser | ScimRoute::ReplaceUser(_) | ScimRoute::PatchUser(_) => {
+                        debug!(route = ?route, "SCIM endpoint hit, waiting for body");
+                        if let Ok(mut buffer) = self.body_buffer.write() {
+                            let key = format!("scim:{}:{}", route_key(&route), event.metadata.correlation_id);
+                            buffer.insert(key, Vec::new());
+                        }
+                        return AgentResponse::needs_more_data();
+                    }
+                }
+            } else {
+                return scim_error_response(404, "SCIM endpoint not found");
+            }
+        }
+
         // Check if this is the token exchange endpoint (POST)
         let exchange_config = self.get_exchange_config().unwrap_or_default();
         if exchange_config.enabled && request_path == exchange_config.endpoint_path && request_method == "POST" {
@@ -1410,6 +1549,26 @@ impl AgentHandlerV2 for AuthAgent {
             if auth_header.starts_with("Bearer ") || auth_header.starts_with("bearer ") {
                 let token = &auth_header[7..];
                 if let Ok(identity) = self.authenticate_oidc(token).await {
+                    // Check SCIM active status enforcement
+                    if scim_config.enabled && scim_config.enforce_active_status {
+                        if let Some(ref store) = self.scim_store {
+                            // Look up by OIDC subject claim (externalId)
+                            if let Ok(Some(false)) = store.is_user_active_by_external_id(&identity.id) {
+                                info!(
+                                    user_id = %identity.id,
+                                    "OIDC auth blocked: SCIM user is deactivated"
+                                );
+                                self.auth_failure_total.fetch_add(1, Ordering::Relaxed);
+                                return AgentResponse::block(403, Some("Account deactivated".to_string()))
+                                    .with_audit(AuditMetadata {
+                                        tags: vec!["auth".to_string(), "scim".to_string(), "deactivated".to_string()],
+                                        reason_codes: vec!["SCIM_USER_INACTIVE".to_string()],
+                                        ..Default::default()
+                                    });
+                            }
+                        }
+                    }
+
                     info!(
                         user_id = %identity.id,
                         method = %identity.method,
@@ -1476,11 +1635,16 @@ impl AgentHandlerV2 for AuthAgent {
     async fn on_request_body_chunk(&self, event: RequestBodyChunkEvent) -> AgentResponse {
         // Check if this is a token exchange request
         let exchange_key = format!("exchange:{}", event.correlation_id);
-        let is_exchange = {
+        let (is_exchange, scim_key) = {
             if let Ok(buffer) = self.body_buffer.read() {
-                buffer.contains_key(&exchange_key)
+                let is_exchange = buffer.contains_key(&exchange_key);
+                // Find SCIM key by suffix match on correlation_id
+                let scim_key = buffer.keys()
+                    .find(|k| k.starts_with("scim:") && k.ends_with(&event.correlation_id))
+                    .cloned();
+                (is_exchange, scim_key)
             } else {
-                false
+                (false, None)
             }
         };
 
@@ -1488,6 +1652,8 @@ impl AgentHandlerV2 for AuthAgent {
         if let Ok(mut buffer) = self.body_buffer.write() {
             let key = if is_exchange {
                 exchange_key.clone()
+            } else if let Some(ref sk) = scim_key {
+                sk.clone()
             } else {
                 event.correlation_id.clone()
             };
@@ -1501,6 +1667,33 @@ impl AgentHandlerV2 for AuthAgent {
             // Handle token exchange
             if is_exchange {
                 return self.handle_exchange_body(&event.correlation_id, &exchange_key).await;
+            }
+
+            // Handle SCIM body requests (POST/PUT/PATCH)
+            if let Some(ref sk) = scim_key {
+                let body_data = {
+                    let mut buffer = match self.body_buffer.write() {
+                        Ok(b) => b,
+                        Err(_) => return scim_error_response(500, "Internal error"),
+                    };
+                    buffer.remove(sk).unwrap_or_default()
+                };
+
+                let route = match parse_scim_buffer_key(sk) {
+                    Some(r) => r,
+                    None => return scim_error_response(500, "Failed to parse SCIM route from buffer key"),
+                };
+
+                let scim_store = match &self.scim_store {
+                    Some(s) => s,
+                    None => return scim_error_response(503, "SCIM store not initialized"),
+                };
+
+                let base_url = self.get_scim_config()
+                    .map(|c| c.effective_base_url())
+                    .unwrap_or_else(|_| "/scim/v2".to_string());
+
+                return handle_scim_body(scim_store, &route, &body_data, &base_url);
             }
 
             // Handle SAML ACS
@@ -1687,8 +1880,27 @@ async fn main() -> Result<()> {
         spawn_cleanup_task(Arc::clone(store), DEFAULT_CLEANUP_INTERVAL_SECS)
     });
 
-    // Create agent with session store
-    let agent = AuthAgent::new(config, session_store);
+    // Initialize SCIM user store
+    let scim_store_path = std::env::var("SCIM_STORE_PATH")
+        .unwrap_or_else(|_| "/var/lib/sentinel-auth/scim_users.redb".to_string());
+
+    let scim_store = match ScimUserStore::open(PathBuf::from(&scim_store_path)) {
+        Ok(store) => {
+            info!(path = %scim_store_path, "SCIM user store initialized");
+            Some(Arc::new(store))
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = %scim_store_path,
+                "Failed to initialize SCIM store, SCIM provisioning will be unavailable"
+            );
+            None
+        }
+    };
+
+    // Create agent with session store and SCIM store
+    let agent = AuthAgent::new(config, session_store, scim_store);
 
     // Start agent server with appropriate transport
     if let Some(grpc_address) = args.grpc_address {
@@ -1756,6 +1968,38 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Convert a ScimRoute to a string key for body buffering.
+fn route_key(route: &ScimRoute) -> String {
+    match route {
+        ScimRoute::CreateUser => "create".to_string(),
+        ScimRoute::ReplaceUser(id) => format!("replace:{}", id),
+        ScimRoute::PatchUser(id) => format!("patch:{}", id),
+        ScimRoute::GetUser(id) => format!("get:{}", id),
+        ScimRoute::ListUsers => "list".to_string(),
+        ScimRoute::DeleteUser(id) => format!("delete:{}", id),
+    }
+}
+
+/// Parse a SCIM body buffer key back to a ScimRoute.
+fn parse_scim_buffer_key(key: &str) -> Option<ScimRoute> {
+    // Key format: "scim:{route_key}:{correlation_id}"
+    let rest = key.strip_prefix("scim:")?;
+    // Find the last ':' to split route_key from correlation_id
+    // route_key can contain ':' (e.g. "replace:uuid"), so we need to handle that
+    if rest.starts_with("create:") {
+        Some(ScimRoute::CreateUser)
+    } else if let Some(rest) = rest.strip_prefix("replace:") {
+        // rest is "{id}:{correlation_id}"
+        let id = rest.rsplit_once(':')?.0;
+        Some(ScimRoute::ReplaceUser(id.to_string()))
+    } else if let Some(rest) = rest.strip_prefix("patch:") {
+        let id = rest.rsplit_once(':')?.0;
+        Some(ScimRoute::PatchUser(id.to_string()))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1797,7 +2041,7 @@ mod tests {
     #[test]
     fn test_api_key_auth() {
         let config = test_config();
-        let agent = AuthAgent::new(config, None);
+        let agent = AuthAgent::new(config, None, None);
 
         let mut headers = HashMap::new();
         headers.insert("X-API-Key".to_string(), vec!["test-key-123".to_string()]);
@@ -1813,7 +2057,7 @@ mod tests {
     #[test]
     fn test_basic_auth() {
         let config = test_config();
-        let agent = AuthAgent::new(config, None);
+        let agent = AuthAgent::new(config, None, None);
 
         // Base64 encode "testuser:testpass"
         let credentials = BASE64.encode("testuser:testpass");
@@ -1831,7 +2075,7 @@ mod tests {
     #[test]
     fn test_invalid_api_key() {
         let config = test_config();
-        let agent = AuthAgent::new(config, None);
+        let agent = AuthAgent::new(config, None, None);
 
         let mut headers = HashMap::new();
         headers.insert("X-API-Key".to_string(), vec!["invalid-key".to_string()]);
@@ -1843,7 +2087,7 @@ mod tests {
     #[test]
     fn test_no_auth() {
         let config = test_config();
-        let agent = AuthAgent::new(config, None);
+        let agent = AuthAgent::new(config, None, None);
 
         let mut headers = HashMap::new();
         headers.insert("Content-Type".to_string(), vec!["application/json".to_string()]);

@@ -287,6 +287,42 @@ See [Token Exchange](token-exchange.md) for detailed guide.
 | `token-ttl-secs` | int | `3600` | Token lifetime in seconds |
 | `allowed-exchanges` | array | `[]` | Allowed token type conversions |
 
+## SCIM Provisioning Configuration
+
+SCIM 2.0 (RFC 7644) user provisioning endpoint for IdP-driven user lifecycle management.
+
+See [SCIM Provisioning](scim.md) for detailed guide and IdP setup instructions.
+
+### JSON Configuration
+
+```json
+{
+  "scim": {
+    "enabled": true,
+    "base-path": "/scim/v2",
+    "bearer-token": "your-scim-provisioning-secret",
+    "use-oidc-auth": true,
+    "required-scope": "scim:write",
+    "store-path": "/var/lib/zentinel-auth/scim_users.redb",
+    "enforce-active-status": true,
+    "location-base-url": "https://auth.example.com/scim/v2"
+  }
+}
+```
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable SCIM provisioning endpoint |
+| `base-path` | string | `/scim/v2` | Base path for SCIM endpoints |
+| `bearer-token` | string | - | Static bearer token for SCIM auth |
+| `use-oidc-auth` | bool | `true` | Use OIDC token validation for SCIM auth |
+| `required-scope` | string | - | Required OAuth scope (e.g. `scim:write`) |
+| `store-path` | string | `/var/lib/zentinel-auth/scim_users.redb` | Path to SCIM user database |
+| `enforce-active-status` | bool | `true` | Block deactivated SCIM users during OIDC auth |
+| `location-base-url` | string | - | Base URL for `meta.location` URLs |
+
 ## Environment Variable Examples
 
 ```bash
@@ -311,6 +347,9 @@ export AUTH_METHOD_HEADER="X-Auth-Method"
 
 # Socket
 export AGENT_SOCKET="/var/run/zentinel/auth.sock"
+
+# SCIM Provisioning
+export SCIM_STORE_PATH="/var/lib/zentinel-auth/scim_users.redb"
 ```
 
 ## Headers Added to Requests

@@ -1,6 +1,6 @@
 # zentinel-agent-auth
 
-Authentication and authorization agent for [Zentinel](https://github.com/zentinelproxy/zentinel) reverse proxy. Supports JWT/Bearer tokens, OIDC/OAuth 2.0, API keys, Basic authentication, SAML SSO, and mTLS client certificates.
+Authentication and authorization agent for [Zentinel](https://github.com/zentinelproxy/zentinel) reverse proxy. Supports JWT/Bearer tokens, OIDC/OAuth 2.0, API keys, Basic authentication, SAML SSO, mTLS client certificates, and SCIM 2.0 user provisioning.
 
 ## Features
 
@@ -18,6 +18,9 @@ Authentication and authorization agent for [Zentinel](https://github.com/zentine
 ### Token Services
 - **Token Exchange (RFC 8693)** - Convert between token types (SAML to JWT, external to internal JWT)
 
+### Provisioning
+- **SCIM 2.0 (RFC 7644)** - Dynamic user provisioning from IdPs (Keycloak, Kanidm, Okta, Azure AD)
+
 ### General
 - Configurable user ID and auth method headers
 - Fail-open mode for graceful degradation
@@ -32,6 +35,7 @@ Authentication and authorization agent for [Zentinel](https://github.com/zentine
 - [mTLS Authentication](docs/mtls.md) - Client certificate authentication
 - [Authorization](docs/authorization.md) - Cedar policy engine guide
 - [Token Exchange](docs/token-exchange.md) - RFC 8693 token exchange
+- [SCIM Provisioning](docs/scim.md) - SCIM 2.0 user provisioning
 
 ## Installation
 
@@ -75,7 +79,7 @@ zentinel-auth-agent --socket /var/run/zentinel/auth.sock \
 | `--fail-open` | `FAIL_OPEN` | Allow on auth failure | `false` |
 | `--verbose` | `AUTH_VERBOSE` | Enable debug logging | `false` |
 
-See [Configuration Reference](docs/configuration.md) for OIDC, mTLS, Cedar authorization, and token exchange options.
+See [Configuration Reference](docs/configuration.md) for OIDC, mTLS, Cedar authorization, token exchange, and SCIM provisioning options.
 
 ## Authentication Methods
 

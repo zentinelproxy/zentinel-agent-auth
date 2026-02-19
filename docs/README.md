@@ -13,6 +13,7 @@ This directory contains documentation for the Zentinel Authentication and Author
 | [mTLS Authentication](mtls.md) | Client certificate authentication |
 | [Authorization](authorization.md) | Cedar policy engine guide |
 | [Token Exchange](token-exchange.md) | RFC 8693 token exchange |
+| [SCIM Provisioning](scim.md) | SCIM 2.0 user provisioning from IdPs |
 
 ## Quick Links
 
@@ -22,7 +23,7 @@ This directory contains documentation for the Zentinel Authentication and Author
 
 ## Authentication Methods
 
-The agent supports six authentication methods:
+The agent supports six authentication methods and SCIM provisioning:
 
 1. **JWT/Bearer Tokens** - Industry-standard JSON Web Tokens with HS256, RS256, ES256
 2. **OIDC/OAuth 2.0** - OpenID Connect with automatic JWKS key rotation
@@ -41,6 +42,10 @@ The agent supports policy-based authorization using the Cedar Policy Engine:
 ## Token Services
 
 - **Token Exchange (RFC 8693)** - Convert between token types (SAML→JWT, external→internal JWT)
+
+## Provisioning
+
+- **SCIM 2.0 (RFC 7644)** - Dynamic user provisioning from IdPs (Keycloak, Kanidm, Okta, Azure AD)
 
 ## Architecture
 
@@ -68,6 +73,10 @@ The agent supports policy-based authorization using the Cedar Policy Engine:
                     │  ┌────────────┐  │
                     │  │ Session    │  │
                     │  │ Store      │  │
+                    │  └────────────┘  │
+                    │  ┌────────────┐  │
+                    │  │ SCIM       │  │
+                    │  │ Provision  │  │
                     │  └────────────┘  │
                     └──────────────────┘
 ```
@@ -118,6 +127,13 @@ After authentication:
 2. Cedar evaluates policies against request
 3. If allowed: request proceeds to upstream
 4. If denied: returns 403 Forbidden with policy reason
+
+### SCIM Provisioning
+
+1. IdP sends SCIM request (POST/PUT/PATCH/DELETE) with bearer token
+2. Agent validates bearer token (static or OIDC)
+3. Agent performs the requested user operation (create, update, deactivate)
+4. On subsequent OIDC auth, deactivated SCIM users are blocked with 403
 
 ## Getting Help
 
