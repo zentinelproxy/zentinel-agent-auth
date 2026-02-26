@@ -28,7 +28,7 @@ use zentinel_agent_protocol::{
 };
 use zentinel_agent_protocol::v2::{
     AgentCapabilities, AgentFeatures, AgentHandlerV2, CounterMetric, DrainReason,
-    GrpcAgentServerV2, HealthStatus, MetricsReport, ShutdownReason,
+    GrpcAgentServerV2, HealthStatus, MetricsReport, ShutdownReason, UdsAgentServerV2,
 };
 use zentinel_agent_protocol::EventType;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1917,51 +1917,13 @@ async fn main() -> Result<()> {
         let server = GrpcAgentServerV2::new("zentinel-auth-agent", Box::new(agent));
         server.run(addr).await.map_err(|e| anyhow::anyhow!("{}", e))?;
     } else {
-        // Use UDS transport (v1 fallback for now, as v2 UDS server is client-side only)
-        // In a real deployment, you'd use gRPC for v2 or implement a v2 UDS server
+        // Use UDS transport (v2 protocol)
         info!(
             socket = ?args.socket,
-            "Starting auth agent with UDS transport"
+            "Starting auth agent with UDS v2 transport"
         );
 
-        // For UDS, we need to use the v1 server since v2 UDS is primarily client-side
-        // The v2 protocol is fully supported over gRPC
-        use zentinel_agent_protocol::{AgentServer, AgentHandler};
-
-        // Create a v1-compatible wrapper
-        struct V1Wrapper(AuthAgent);
-
-        #[async_trait::async_trait]
-        impl AgentHandler for V1Wrapper {
-            async fn on_configure(&self, event: zentinel_agent_protocol::ConfigureEvent) -> AgentResponse {
-                // Forward to v2 handler
-                let success = self.0.on_configure(event.config, None).await;
-                if success {
-                    AgentResponse::default_allow()
-                } else {
-                    AgentResponse::block(500, Some("Configuration failed".to_string()))
-                }
-            }
-
-            async fn on_request_headers(&self, event: RequestHeadersEvent) -> AgentResponse {
-                AgentHandlerV2::on_request_headers(&self.0, event).await
-            }
-
-            async fn on_request_body_chunk(&self, event: RequestBodyChunkEvent) -> AgentResponse {
-                AgentHandlerV2::on_request_body_chunk(&self.0, event).await
-            }
-
-            async fn on_response_headers(&self, event: ResponseHeadersEvent) -> AgentResponse {
-                AgentHandlerV2::on_response_headers(&self.0, event).await
-            }
-        }
-
-        let wrapped_agent = V1Wrapper(agent);
-        let server = AgentServer::new(
-            "zentinel-auth-agent",
-            args.socket,
-            Box::new(wrapped_agent),
-        );
+        let server = UdsAgentServerV2::new("zentinel-auth-agent", args.socket, Box::new(agent));
         server.run().await.map_err(|e| anyhow::anyhow!("{}", e))?;
     }
 

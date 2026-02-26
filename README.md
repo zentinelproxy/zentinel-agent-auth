@@ -135,7 +135,7 @@ Configure OIDC with automatic JWKS key fetching and refresh:
 ```kdl
 config {
     oidc {
-        enabled true
+        enabled #true
         issuer "https://auth.example.com"
         jwks-url "https://auth.example.com/.well-known/jwks.json"
         audience "my-api"
@@ -156,10 +156,10 @@ Authenticate clients using X.509 certificates (requires Zentinel proxy to forwar
 ```kdl
 config {
     mtls {
-        enabled true
+        enabled #true
         client-cert-header "X-Client-Cert"
         allowed-dns "CN=service.example.com,O=Example"
-        extract-cn-as-user true
+        extract-cn-as-user #true
     }
 }
 ```
@@ -173,7 +173,7 @@ After authentication, requests can be authorized using Cedar policies:
 ```kdl
 config {
     authz {
-        enabled true
+        enabled #true
         policy-file "/etc/zentinel/policies/auth.cedar"
         default-decision "deny"
     }
@@ -223,7 +223,7 @@ agents {
         transport "unix_socket" {
             path "/var/run/zentinel/auth.sock"
         }
-        events ["request_headers"]
+        events "request_headers"
         timeout-ms 50
         failure-mode "open"
     }
@@ -231,9 +231,11 @@ agents {
 
 routes {
     route "api" {
-        matches { path-prefix "/api" }
+        matches {
+            path-prefix "/api"
+        }
         upstream "backend"
-        agents ["auth"]
+        agents "auth"
     }
 }
 ```
