@@ -1,4 +1,5 @@
 //! Token issuer for generating exchanged tokens.
+#![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -89,8 +90,8 @@ impl TokenIssuer {
         };
 
         let header = Header::new(self.algorithm);
-        let token = encode(&header, &claims, &self.encoding_key)
-            .context("Failed to encode token")?;
+        let token =
+            encode(&header, &claims, &self.encoding_key).context("Failed to encode token")?;
 
         debug!(
             sub = %subject,
@@ -192,10 +193,15 @@ fn create_encoding_key(key_data: &str, algorithm: Algorithm) -> Result<EncodingK
         }
         Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
             // Symmetric key - could be base64 encoded or raw
-            let key_bytes = if key_data.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=') {
+            let key_bytes = if key_data
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+            {
                 // Looks like base64
                 use base64::{engine::general_purpose::STANDARD, Engine};
-                STANDARD.decode(key_data).unwrap_or_else(|_| key_data.as_bytes().to_vec())
+                STANDARD
+                    .decode(key_data)
+                    .unwrap_or_else(|_| key_data.as_bytes().to_vec())
             } else {
                 key_data.as_bytes().to_vec()
             };

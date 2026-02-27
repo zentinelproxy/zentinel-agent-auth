@@ -191,7 +191,10 @@ mod tests {
         assert!(config.is_san_allowed("user@example.com"));
 
         // With restrictions
-        config.allowed_sans = vec!["user@example.com".to_string(), "service.example.com".to_string()];
+        config.allowed_sans = vec![
+            "user@example.com".to_string(),
+            "service.example.com".to_string(),
+        ];
         assert!(config.is_san_allowed("user@example.com"));
         assert!(config.is_san_allowed("service.example.com"));
         assert!(!config.is_san_allowed("other@example.com"));

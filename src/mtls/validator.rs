@@ -1,4 +1,5 @@
 //! mTLS certificate validation.
+#![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
@@ -42,10 +43,7 @@ pub struct MtlsIdentity {
 }
 
 /// Validate a client certificate and extract identity.
-pub fn validate_client_cert(
-    config: &MtlsConfig,
-    cert_data: &str,
-) -> Result<MtlsIdentity> {
+pub fn validate_client_cert(config: &MtlsConfig, cert_data: &str) -> Result<MtlsIdentity> {
     // Decode certificate (may be URL-encoded or base64)
     let cert_bytes = decode_cert_data(cert_data)?;
 
@@ -154,9 +152,11 @@ fn decode_cert_data(data: &str) -> Result<Vec<u8>> {
         let start_marker = "-----BEGIN CERTIFICATE-----";
         let end_marker = "-----END CERTIFICATE-----";
 
-        let start = decoded.find(start_marker)
+        let start = decoded
+            .find(start_marker)
             .ok_or_else(|| anyhow!("Invalid PEM: missing BEGIN marker"))?;
-        let end = decoded.find(end_marker)
+        let end = decoded
+            .find(end_marker)
             .ok_or_else(|| anyhow!("Invalid PEM: missing END marker"))?;
 
         let base64_content: String = decoded[start + start_marker.len()..end]
@@ -165,7 +165,8 @@ fn decode_cert_data(data: &str) -> Result<Vec<u8>> {
             .collect();
 
         use base64::{engine::general_purpose::STANDARD, Engine};
-        STANDARD.decode(&base64_content)
+        STANDARD
+            .decode(&base64_content)
             .context("Failed to decode PEM base64 content")
     } else {
         // Try base64 decoding (might be raw DER in base64)

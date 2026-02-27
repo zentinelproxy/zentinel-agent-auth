@@ -31,10 +31,7 @@ pub fn spawn_cleanup_task(
             match session_store.evict_expired() {
                 Ok(count) => {
                     if count > 0 {
-                        info!(
-                            evicted = count,
-                            "Session cleanup completed"
-                        );
+                        info!(evicted = count, "Session cleanup completed");
                     } else {
                         debug!("Session cleanup: no expired sessions");
                     }

@@ -1,7 +1,10 @@
 //! Cedar policy engine integration.
+#![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
-use cedar_policy::{Authorizer, Context as CedarContext, Decision, Entities, EntityUid, PolicySet, Request};
+use cedar_policy::{
+    Authorizer, Context as CedarContext, Decision, Entities, EntityUid, PolicySet, Request,
+};
 use std::collections::HashMap;
 use std::str::FromStr;
 use tracing::{debug, info, warn};
@@ -74,7 +77,10 @@ impl CedarAuthorizer {
         claims: &HashMap<String, String>,
     ) -> AuthzDecision {
         // Build Cedar entities
-        let principal = match EntityUid::from_str(&format!("User::\"{}\"", escape_cedar_string(principal_id))) {
+        let principal = match EntityUid::from_str(&format!(
+            "User::\"{}\"",
+            escape_cedar_string(principal_id)
+        )) {
             Ok(uid) => uid,
             Err(e) => {
                 warn!(error = %e, "Failed to parse principal");
@@ -98,7 +104,10 @@ impl CedarAuthorizer {
             }
         };
 
-        let resource = match EntityUid::from_str(&format!("Resource::\"{}\"", escape_cedar_string(resource_path))) {
+        let resource = match EntityUid::from_str(&format!(
+            "Resource::\"{}\"",
+            escape_cedar_string(resource_path)
+        )) {
             Ok(uid) => uid,
             Err(e) => {
                 warn!(error = %e, "Failed to parse resource");
@@ -136,7 +145,9 @@ impl CedarAuthorizer {
         let entities = Entities::empty();
 
         // Evaluate
-        let response = self.authorizer.is_authorized(&request, &self.policies, &entities);
+        let response = self
+            .authorizer
+            .is_authorized(&request, &self.policies, &entities);
 
         let allowed = response.decision() == Decision::Allow;
         let policy_ids: Vec<String> = response
@@ -179,7 +190,7 @@ impl CedarAuthorizer {
 }
 
 /// Build Cedar context from claims map.
-fn build_context(claims: &HashMap<String, String>) -> CedarContext {
+fn build_context(_claims: &HashMap<String, String>) -> CedarContext {
     // Convert claims to Cedar context
     // For now, create an empty context - claims should be in principal attributes
     // In a more complete implementation, you'd build a proper context record

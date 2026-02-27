@@ -1,7 +1,7 @@
 //! SCIM 2.0 request routing and handling (RFC 7644).
 
-use zentinel_agent_protocol::{AgentResponse, AuditMetadata, HeaderOp};
 use tracing::{info, warn};
+use zentinel_agent_protocol::{AgentResponse, AuditMetadata, HeaderOp};
 
 use super::store::ScimUserStore;
 use super::types::{
@@ -89,16 +89,14 @@ pub fn handle_scim_get(
     _base_url: &str,
 ) -> AgentResponse {
     match route {
-        ScimRoute::GetUser(id) => {
-            match store.get(id) {
-                Ok(Some(user)) => scim_response(200, &user),
-                Ok(None) => scim_error_response(404, &format!("User '{}' not found", id)),
-                Err(e) => {
-                    warn!(error = %e, "SCIM get user error");
-                    scim_error_response(500, "Internal server error")
-                }
+        ScimRoute::GetUser(id) => match store.get(id) {
+            Ok(Some(user)) => scim_response(200, &user),
+            Ok(None) => scim_error_response(404, &format!("User '{}' not found", id)),
+            Err(e) => {
+                warn!(error = %e, "SCIM get user error");
+                scim_error_response(500, "Internal server error")
             }
-        }
+        },
         ScimRoute::ListUsers => {
             // Parse query parameters
             let (start_index, count, filter) = parse_query_params(query_string);
@@ -209,21 +207,19 @@ fn handle_create(store: &ScimUserStore, body: &str, base_url: &str) -> AgentResp
 
             let location = created.meta.location.clone();
             match serde_json::to_string(&created) {
-                Ok(json) => {
-                    AgentResponse::block(201, Some(json))
-                        .add_response_header(HeaderOp::Set {
-                            name: "Content-Type".to_string(),
-                            value: "application/scim+json".to_string(),
-                        })
-                        .add_response_header(HeaderOp::Set {
-                            name: "Location".to_string(),
-                            value: location,
-                        })
-                        .with_audit(AuditMetadata {
-                            tags: vec!["scim".to_string(), "create".to_string()],
-                            ..Default::default()
-                        })
-                }
+                Ok(json) => AgentResponse::block(201, Some(json))
+                    .add_response_header(HeaderOp::Set {
+                        name: "Content-Type".to_string(),
+                        value: "application/scim+json".to_string(),
+                    })
+                    .add_response_header(HeaderOp::Set {
+                        name: "Location".to_string(),
+                        value: location,
+                    })
+                    .with_audit(AuditMetadata {
+                        tags: vec!["scim".to_string(), "create".to_string()],
+                        ..Default::default()
+                    }),
                 Err(_) => scim_error_response(500, "Failed to serialize response"),
             }
         }
@@ -232,17 +228,19 @@ fn handle_create(store: &ScimUserStore, body: &str, base_url: &str) -> AgentResp
             if msg.contains("already exists") {
                 let err = ScimError::uniqueness(&msg);
                 match serde_json::to_string(&err) {
-                    Ok(json) => {
-                        AgentResponse::block(409, Some(json))
-                            .add_response_header(HeaderOp::Set {
-                                name: "Content-Type".to_string(),
-                                value: "application/scim+json".to_string(),
-                            })
-                            .with_audit(AuditMetadata {
-                                tags: vec!["scim".to_string(), "create".to_string(), "conflict".to_string()],
-                                ..Default::default()
-                            })
-                    }
+                    Ok(json) => AgentResponse::block(409, Some(json))
+                        .add_response_header(HeaderOp::Set {
+                            name: "Content-Type".to_string(),
+                            value: "application/scim+json".to_string(),
+                        })
+                        .with_audit(AuditMetadata {
+                            tags: vec![
+                                "scim".to_string(),
+                                "create".to_string(),
+                                "conflict".to_string(),
+                            ],
+                            ..Default::default()
+                        }),
                     Err(_) => scim_error_response(409, &msg),
                 }
             } else {
@@ -281,11 +279,10 @@ fn handle_replace(store: &ScimUserStore, id: &str, body: &str, base_url: &str) -
                 let err = ScimError::uniqueness(&msg);
                 match serde_json::to_string(&err) {
                     Ok(json) => {
-                        AgentResponse::block(409, Some(json))
-                            .add_response_header(HeaderOp::Set {
-                                name: "Content-Type".to_string(),
-                                value: "application/scim+json".to_string(),
-                            })
+                        AgentResponse::block(409, Some(json)).add_response_header(HeaderOp::Set {
+                            name: "Content-Type".to_string(),
+                            value: "application/scim+json".to_string(),
+                        })
                     }
                     Err(_) => scim_error_response(409, &msg),
                 }
@@ -304,7 +301,10 @@ fn handle_patch(store: &ScimUserStore, id: &str, body: &str) -> AgentResponse {
     };
 
     // Validate schema
-    if !patch_req.schemas.contains(&SCIM_PATCH_OP_SCHEMA.to_string()) {
+    if !patch_req
+        .schemas
+        .contains(&SCIM_PATCH_OP_SCHEMA.to_string())
+    {
         return scim_error_response(400, "Missing PatchOp schema in request");
     }
 
@@ -337,11 +337,10 @@ fn handle_patch(store: &ScimUserStore, id: &str, body: &str) -> AgentResponse {
                 let err = ScimError::uniqueness(&msg);
                 match serde_json::to_string(&err) {
                     Ok(json) => {
-                        AgentResponse::block(409, Some(json))
-                            .add_response_header(HeaderOp::Set {
-                                name: "Content-Type".to_string(),
-                                value: "application/scim+json".to_string(),
-                            })
+                        AgentResponse::block(409, Some(json)).add_response_header(HeaderOp::Set {
+                            name: "Content-Type".to_string(),
+                            value: "application/scim+json".to_string(),
+                        })
                     }
                     Err(_) => scim_error_response(409, &msg),
                 }
@@ -359,29 +358,33 @@ fn apply_patch_op(user: &mut ScimUser, op: &PatchOperation) -> Result<(), String
     match op_type.as_str() {
         "replace" | "add" => {
             let path = op.path.as_deref().unwrap_or("");
-            let value = op.value.as_ref()
+            let value = op
+                .value
+                .as_ref()
                 .ok_or_else(|| format!("{} operation requires a value", op_type))?;
 
             match path {
                 "userName" => {
-                    user.user_name = value.as_str()
+                    user.user_name = value
+                        .as_str()
                         .ok_or("userName must be a string")?
                         .to_string();
                 }
                 "displayName" => {
                     user.display_name = Some(
-                        value.as_str()
+                        value
+                            .as_str()
                             .ok_or("displayName must be a string")?
                             .to_string(),
                     );
                 }
                 "active" => {
-                    user.active = value.as_bool()
-                        .ok_or("active must be a boolean")?;
+                    user.active = value.as_bool().ok_or("active must be a boolean")?;
                 }
                 "externalId" => {
                     user.external_id = Some(
-                        value.as_str()
+                        value
+                            .as_str()
                             .ok_or("externalId must be a string")?
                             .to_string(),
                     );
@@ -389,7 +392,8 @@ fn apply_patch_op(user: &mut ScimUser, op: &PatchOperation) -> Result<(), String
                 "name.givenName" => {
                     let name = user.name.get_or_insert_with(Default::default);
                     name.given_name = Some(
-                        value.as_str()
+                        value
+                            .as_str()
                             .ok_or("name.givenName must be a string")?
                             .to_string(),
                     );
@@ -397,7 +401,8 @@ fn apply_patch_op(user: &mut ScimUser, op: &PatchOperation) -> Result<(), String
                 "name.familyName" => {
                     let name = user.name.get_or_insert_with(Default::default);
                     name.family_name = Some(
-                        value.as_str()
+                        value
+                            .as_str()
                             .ok_or("name.familyName must be a string")?
                             .to_string(),
                     );
@@ -405,14 +410,16 @@ fn apply_patch_op(user: &mut ScimUser, op: &PatchOperation) -> Result<(), String
                 "name.formatted" => {
                     let name = user.name.get_or_insert_with(Default::default);
                     name.formatted = Some(
-                        value.as_str()
+                        value
+                            .as_str()
                             .ok_or("name.formatted must be a string")?
                             .to_string(),
                     );
                 }
                 "emails" => {
-                    let emails: Vec<super::types::ScimEmail> = serde_json::from_value(value.clone())
-                        .map_err(|e| format!("Invalid emails value: {}", e))?;
+                    let emails: Vec<super::types::ScimEmail> =
+                        serde_json::from_value(value.clone())
+                            .map_err(|e| format!("Invalid emails value: {}", e))?;
                     user.emails = emails;
                 }
                 "" => {
@@ -427,7 +434,9 @@ fn apply_patch_op(user: &mut ScimUser, op: &PatchOperation) -> Result<(), String
                             apply_patch_op(user, &sub_op)?;
                         }
                     } else {
-                        return Err("Value must be an object when path is not specified".to_string());
+                        return Err(
+                            "Value must be an object when path is not specified".to_string()
+                        );
                     }
                 }
                 other => {
@@ -436,7 +445,9 @@ fn apply_patch_op(user: &mut ScimUser, op: &PatchOperation) -> Result<(), String
             }
         }
         "remove" => {
-            let path = op.path.as_deref()
+            let path = op
+                .path
+                .as_deref()
                 .ok_or("remove operation requires a path")?;
 
             match path {
@@ -546,24 +557,20 @@ fn parse_filter(filter_str: &str) -> Result<(String, String), String> {
 /// Build a SCIM JSON response with proper content type.
 pub fn scim_response<T: serde::Serialize>(status: u16, body: &T) -> AgentResponse {
     match serde_json::to_string(body) {
-        Ok(json) => {
-            AgentResponse::block(status, Some(json))
-                .add_response_header(HeaderOp::Set {
-                    name: "Content-Type".to_string(),
-                    value: "application/scim+json".to_string(),
-                })
-                .with_audit(AuditMetadata {
-                    tags: vec!["scim".to_string()],
-                    ..Default::default()
-                })
-        }
-        Err(_) => {
-            AgentResponse::block(500, Some("Internal server error".to_string()))
-                .add_response_header(HeaderOp::Set {
-                    name: "Content-Type".to_string(),
-                    value: "application/scim+json".to_string(),
-                })
-        }
+        Ok(json) => AgentResponse::block(status, Some(json))
+            .add_response_header(HeaderOp::Set {
+                name: "Content-Type".to_string(),
+                value: "application/scim+json".to_string(),
+            })
+            .with_audit(AuditMetadata {
+                tags: vec!["scim".to_string()],
+                ..Default::default()
+            }),
+        Err(_) => AgentResponse::block(500, Some("Internal server error".to_string()))
+            .add_response_header(HeaderOp::Set {
+                name: "Content-Type".to_string(),
+                value: "application/scim+json".to_string(),
+            }),
     }
 }
 
@@ -571,17 +578,15 @@ pub fn scim_response<T: serde::Serialize>(status: u16, body: &T) -> AgentRespons
 pub fn scim_error_response(status: u16, detail: &str) -> AgentResponse {
     let err = ScimError::new(status, detail);
     match serde_json::to_string(&err) {
-        Ok(json) => {
-            AgentResponse::block(status, Some(json))
-                .add_response_header(HeaderOp::Set {
-                    name: "Content-Type".to_string(),
-                    value: "application/scim+json".to_string(),
-                })
-                .with_audit(AuditMetadata {
-                    tags: vec!["scim".to_string(), "error".to_string()],
-                    ..Default::default()
-                })
-        }
+        Ok(json) => AgentResponse::block(status, Some(json))
+            .add_response_header(HeaderOp::Set {
+                name: "Content-Type".to_string(),
+                value: "application/scim+json".to_string(),
+            })
+            .with_audit(AuditMetadata {
+                tags: vec!["scim".to_string(), "error".to_string()],
+                ..Default::default()
+            }),
         Err(_) => AgentResponse::block(status, Some(detail.to_string())),
     }
 }
@@ -648,22 +653,13 @@ mod tests {
 
     #[test]
     fn test_route_matching_no_match() {
-        assert_eq!(
-            match_scim_route("/scim/v2", "/api/users", "GET"),
-            None
-        );
-        assert_eq!(
-            match_scim_route("/scim/v2", "/scim/v2/Groups", "GET"),
-            None
-        );
+        assert_eq!(match_scim_route("/scim/v2", "/api/users", "GET"), None);
+        assert_eq!(match_scim_route("/scim/v2", "/scim/v2/Groups", "GET"), None);
     }
 
     #[test]
     fn test_route_matching_empty_id() {
-        assert_eq!(
-            match_scim_route("/scim/v2", "/scim/v2/Users/", "GET"),
-            None
-        );
+        assert_eq!(match_scim_route("/scim/v2", "/scim/v2/Users/", "GET"), None);
     }
 
     #[test]

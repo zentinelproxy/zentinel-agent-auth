@@ -79,12 +79,17 @@ impl ScimConfig {
 
         // Must have at least one auth method
         if self.bearer_token.is_none() && !self.use_oidc_auth {
-            return Err("SCIM requires either bearer_token or use_oidc_auth to be configured".to_string());
+            return Err(
+                "SCIM requires either bearer_token or use_oidc_auth to be configured".to_string(),
+            );
         }
 
         // Base path must start with /
         if !self.base_path.starts_with('/') {
-            return Err(format!("SCIM base_path must start with '/': {}", self.base_path));
+            return Err(format!(
+                "SCIM base_path must start with '/': {}",
+                self.base_path
+            ));
         }
 
         // Store path must not be empty
@@ -254,6 +259,9 @@ mod tests {
         assert_eq!(config.effective_base_url(), "/scim/v2");
 
         config.location_base_url = Some("https://auth.example.com/scim/v2".to_string());
-        assert_eq!(config.effective_base_url(), "https://auth.example.com/scim/v2");
+        assert_eq!(
+            config.effective_base_url(),
+            "https://auth.example.com/scim/v2"
+        );
     }
 }

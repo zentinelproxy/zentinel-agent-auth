@@ -19,10 +19,15 @@ const SCIM_USERS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("sci
 /// Secondary index: externalId -> UUID.
 const SCIM_EXT_INDEX: TableDefinition<&str, &str> = TableDefinition::new("scim_ext_index");
 /// Secondary index: userName -> UUID.
-const SCIM_USERNAME_INDEX: TableDefinition<&str, &str> = TableDefinition::new("scim_username_index");
+const SCIM_USERNAME_INDEX: TableDefinition<&str, &str> =
+    TableDefinition::new("scim_username_index");
 
 /// Loaded cache tuple: (users, ext_id_index, username_index).
-type LoadedCaches = (HashMap<String, ScimUser>, HashMap<String, String>, HashMap<String, String>);
+type LoadedCaches = (
+    HashMap<String, ScimUser>,
+    HashMap<String, String>,
+    HashMap<String, String>,
+);
 
 /// SCIM user store with in-memory caches and persistent storage.
 pub struct ScimUserStore {
@@ -230,7 +235,8 @@ impl ScimUserStore {
     /// Replace a SCIM user (full PUT). Updates indexes atomically.
     pub fn replace(&self, id: &str, mut user: ScimUser) -> Result<ScimUser> {
         // Get old user to clean up old indexes
-        let old_user = self.get(id)?
+        let old_user = self
+            .get(id)?
             .ok_or_else(|| anyhow::anyhow!("User '{}' not found", id))?;
 
         // Check for userName conflict (if changed)
@@ -494,8 +500,12 @@ mod tests {
         let (store, _dir) = test_store();
         assert_eq!(store.count().unwrap(), 0);
 
-        store.create(ScimUser::new("a".to_string(), None, "/scim/v2")).unwrap();
-        store.create(ScimUser::new("b".to_string(), None, "/scim/v2")).unwrap();
+        store
+            .create(ScimUser::new("a".to_string(), None, "/scim/v2"))
+            .unwrap();
+        store
+            .create(ScimUser::new("b".to_string(), None, "/scim/v2"))
+            .unwrap();
         assert_eq!(store.count().unwrap(), 2);
     }
 
@@ -526,7 +536,11 @@ mod tests {
 
         let id = {
             let store = ScimUserStore::open(path.clone()).unwrap();
-            let user = ScimUser::new("persistent".to_string(), Some("ext-p".to_string()), "/scim/v2");
+            let user = ScimUser::new(
+                "persistent".to_string(),
+                Some("ext-p".to_string()),
+                "/scim/v2",
+            );
             let id = user.id.clone();
             store.create(user).unwrap();
             id
@@ -547,11 +561,20 @@ mod tests {
         let id = user.id.clone();
         store.create(user).unwrap();
 
-        assert_eq!(store.is_user_active_by_external_id("oidc-sub").unwrap(), Some(true));
+        assert_eq!(
+            store.is_user_active_by_external_id("oidc-sub").unwrap(),
+            Some(true)
+        );
 
         store.delete(&id).unwrap();
-        assert_eq!(store.is_user_active_by_external_id("oidc-sub").unwrap(), Some(false));
+        assert_eq!(
+            store.is_user_active_by_external_id("oidc-sub").unwrap(),
+            Some(false)
+        );
 
-        assert_eq!(store.is_user_active_by_external_id("unknown").unwrap(), None);
+        assert_eq!(
+            store.is_user_active_by_external_id("unknown").unwrap(),
+            None
+        );
     }
 }

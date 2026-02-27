@@ -125,7 +125,10 @@ impl JwksCache {
     /// Refresh the cache if the refresh interval has elapsed.
     pub async fn refresh_if_needed(&self) -> Result<()> {
         let should_refresh = {
-            let last = self.last_refresh.read().map_err(|_| anyhow!("Lock poisoned"))?;
+            let last = self
+                .last_refresh
+                .read()
+                .map_err(|_| anyhow!("Lock poisoned"))?;
             last.elapsed() >= self.refresh_interval
         };
 
@@ -217,15 +220,26 @@ impl JwksCache {
     fn jwk_to_decoding_key(jwk: &Jwk) -> Result<DecodingKey> {
         match jwk.kty.as_str() {
             "RSA" => {
-                let n = jwk.n.as_ref().ok_or_else(|| anyhow!("RSA key missing 'n'"))?;
-                let e = jwk.e.as_ref().ok_or_else(|| anyhow!("RSA key missing 'e'"))?;
+                let n = jwk
+                    .n
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("RSA key missing 'n'"))?;
+                let e = jwk
+                    .e
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("RSA key missing 'e'"))?;
 
-                DecodingKey::from_rsa_components(n, e)
-                    .context("Failed to create RSA DecodingKey")
+                DecodingKey::from_rsa_components(n, e).context("Failed to create RSA DecodingKey")
             }
             "EC" => {
-                let x = jwk.x.as_ref().ok_or_else(|| anyhow!("EC key missing 'x'"))?;
-                let y = jwk.y.as_ref().ok_or_else(|| anyhow!("EC key missing 'y'"))?;
+                let x = jwk
+                    .x
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("EC key missing 'x'"))?;
+                let y = jwk
+                    .y
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("EC key missing 'y'"))?;
                 let crv = jwk
                     .crv
                     .as_ref()

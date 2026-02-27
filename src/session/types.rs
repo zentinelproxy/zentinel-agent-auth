@@ -1,4 +1,5 @@
 //! Session types for SAML authentication persistence.
+#![allow(dead_code)]
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ impl SessionId {
     }
 
     /// Convert to hex string for storage/cookies.
-    pub fn to_hex(&self) -> String {
+    pub fn to_hex(self) -> String {
         hex::encode(self.0)
     }
 

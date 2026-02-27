@@ -7,4 +7,4 @@ pub mod config;
 pub mod validator;
 
 pub use config::{MtlsConfig, MtlsConfigJson};
-pub use validator::{validate_client_cert, CertificateInfo, MtlsIdentity};
+pub use validator::validate_client_cert;

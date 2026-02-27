@@ -1,4 +1,5 @@
 //! OIDC token validation.
+#![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
 use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
@@ -120,8 +121,12 @@ pub async fn validate_oidc_token(
     let claims = token_data.claims;
 
     // Extract user ID from configured claim
-    let user_id = extract_claim_value(&claims, &config.user_id_claim)
-        .ok_or_else(|| anyhow!("User ID claim '{}' not found in token", config.user_id_claim))?;
+    let user_id = extract_claim_value(&claims, &config.user_id_claim).ok_or_else(|| {
+        anyhow!(
+            "User ID claim '{}' not found in token",
+            config.user_id_claim
+        )
+    })?;
 
     // Extract scopes
     let scopes = extract_scopes(&claims, &config.scope_claim);
@@ -156,14 +161,11 @@ fn extract_claim_value(claims: &OidcClaims, claim_name: &str) -> Option<String> 
         "email" => claims.email.clone(),
         "name" => claims.name.clone(),
         "preferred_username" => claims.preferred_username.clone(),
-        _ => claims
-            .extra
-            .get(claim_name)
-            .and_then(|v| match v {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            }),
+        _ => claims.extra.get(claim_name).and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }),
     }
 }
 

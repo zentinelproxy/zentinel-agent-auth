@@ -9,9 +9,8 @@ pub mod config;
 pub mod handler;
 pub mod issuer;
 
-pub use config::{ExchangeRule, TokenExchangeConfig, TokenExchangeConfigJson, TokenType};
+pub use config::{TokenExchangeConfig, TokenExchangeConfigJson, TokenType};
 pub use handler::{
-    handle_token_exchange, parse_exchange_request, SubjectTokenValidator, TokenExchangeRequest,
-    TokenExchangeResponse, ValidatedSubject,
+    parse_exchange_request, SubjectTokenValidator, TokenExchangeResponse, ValidatedSubject,
 };
 pub use issuer::TokenIssuer;

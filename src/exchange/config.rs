@@ -87,7 +87,9 @@ impl TokenExchangeConfig {
 
         // Must have a signing key
         if self.signing_key_path.is_none() && self.signing_key_inline.is_none() {
-            return Err("Token exchange requires signing_key_path or signing_key_inline".to_string());
+            return Err(
+                "Token exchange requires signing_key_path or signing_key_inline".to_string(),
+            );
         }
 
         // If key path specified, check it exists
@@ -98,7 +100,9 @@ impl TokenExchangeConfig {
         }
 
         // Validate algorithm
-        let valid_algs = ["RS256", "RS384", "RS512", "ES256", "ES384", "HS256", "HS384", "HS512"];
+        let valid_algs = [
+            "RS256", "RS384", "RS512", "ES256", "ES384", "HS256", "HS384", "HS512",
+        ];
         if !valid_algs.contains(&self.signing_algorithm.as_str()) {
             return Err(format!(
                 "Invalid signing algorithm: {}. Valid: {:?}",
@@ -125,7 +129,11 @@ impl TokenExchangeConfig {
     }
 
     /// Get scope mapping for an exchange.
-    pub fn get_scope_mapping(&self, from: &TokenType, to: &TokenType) -> Option<&HashMap<String, Vec<String>>> {
+    pub fn get_scope_mapping(
+        &self,
+        from: &TokenType,
+        to: &TokenType,
+    ) -> Option<&HashMap<String, Vec<String>>> {
         self.allowed_exchanges
             .iter()
             .find(|rule| &rule.subject_token_type == from && &rule.issued_token_type == to)

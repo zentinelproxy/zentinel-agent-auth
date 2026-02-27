@@ -1,6 +1,7 @@
 //! SAML Service Provider implementation.
 //!
 //! Handles SP-initiated SSO flow.
+#![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -192,7 +193,11 @@ impl SamlProvider {
             .and_then(|s| s.session_index.clone());
 
         // Extract IdP entity ID from issuer
-        let idp_entity_id = assertion.issuer.value.clone().unwrap_or_else(|| "unknown".to_string());
+        let idp_entity_id = assertion
+            .issuer
+            .value
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
 
         // Extract attributes
         let mut attributes: HashMap<String, Vec<String>> = HashMap::new();
@@ -201,11 +206,8 @@ impl SamlProvider {
             for attr_statement in attr_statements {
                 for attr in &attr_statement.attributes {
                     if let Some(ref name) = attr.name {
-                        let values: Vec<String> = attr
-                            .values
-                            .iter()
-                            .filter_map(|v| v.value.clone())
-                            .collect();
+                        let values: Vec<String> =
+                            attr.values.iter().filter_map(|v| v.value.clone()).collect();
                         if !values.is_empty() {
                             attributes.insert(name.clone(), values);
                         }

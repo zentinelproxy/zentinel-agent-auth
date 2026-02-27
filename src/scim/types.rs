@@ -145,7 +145,12 @@ pub struct ScimListResponse {
 }
 
 impl ScimListResponse {
-    pub fn new(resources: Vec<ScimUser>, total_results: usize, start_index: usize, items_per_page: usize) -> Self {
+    pub fn new(
+        resources: Vec<ScimUser>,
+        total_results: usize,
+        start_index: usize,
+        items_per_page: usize,
+    ) -> Self {
         Self {
             schemas: vec![SCIM_LIST_SCHEMA.to_string()],
             total_results,
@@ -244,12 +249,19 @@ mod tests {
 
     #[test]
     fn test_scim_user_new() {
-        let user = ScimUser::new("jdoe".to_string(), Some("ext-123".to_string()), "https://example.com/scim/v2");
+        let user = ScimUser::new(
+            "jdoe".to_string(),
+            Some("ext-123".to_string()),
+            "https://example.com/scim/v2",
+        );
         assert_eq!(user.user_name, "jdoe");
         assert_eq!(user.external_id, Some("ext-123".to_string()));
         assert!(user.active);
         assert_eq!(user.schemas, vec![SCIM_USER_SCHEMA]);
-        assert!(user.meta.location.starts_with("https://example.com/scim/v2/Users/"));
+        assert!(user
+            .meta
+            .location
+            .starts_with("https://example.com/scim/v2/Users/"));
         assert_eq!(user.meta.resource_type, "User");
     }
 

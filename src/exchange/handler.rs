@@ -1,6 +1,7 @@
 //! Token exchange handler (RFC 8693).
+#![allow(dead_code)]
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
@@ -179,7 +180,10 @@ pub async fn handle_token_exchange<V: SubjectTokenValidator>(
     // Determine scopes for new token
     let new_scopes = if let Some(ref requested_scope) = request.scope {
         // Use requested scopes (should be subset of original, but we'll trust the config)
-        requested_scope.split_whitespace().map(String::from).collect()
+        requested_scope
+            .split_whitespace()
+            .map(String::from)
+            .collect()
     } else if let Some(mapping) = config.get_scope_mapping(&subject_type, &requested_type) {
         // Apply scope mapping
         let mut mapped = Vec::new();
@@ -327,9 +331,6 @@ mod tests {
         let response = result.unwrap();
         assert!(!response.access_token.is_empty());
         assert_eq!(response.token_type, "Bearer");
-        assert_eq!(
-            response.issued_token_type,
-            TokenType::AccessToken.as_urn()
-        );
+        assert_eq!(response.issued_token_type, TokenType::AccessToken.as_urn());
     }
 }
