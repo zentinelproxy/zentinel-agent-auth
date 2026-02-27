@@ -446,8 +446,10 @@ mod tests {
 
     #[test]
     fn test_path_protection() {
-        let mut config = SamlConfig::default();
-        config.enabled = true;
+        let mut config = SamlConfig {
+            enabled: true,
+            ..SamlConfig::default()
+        };
 
         // Empty protected_paths = protect everything
         assert!(config.should_protect_path("/api/users"));
@@ -480,8 +482,10 @@ mod tests {
 
     #[test]
     fn test_cookie_building() {
-        let mut config = SamlConfig::default();
-        config.cookie_domain = Some("example.com".to_string());
+        let config = SamlConfig {
+            cookie_domain: Some("example.com".to_string()),
+            ..SamlConfig::default()
+        };
 
         let cookie = config.build_cookie("session123");
         assert!(cookie.contains("zentinel_saml_session=session123"));
