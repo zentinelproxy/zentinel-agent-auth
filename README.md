@@ -1,305 +1,198 @@
-# zentinel-agent-auth
+<p align="center">
+  <a href="https://zentinelproxy.io">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/zentinelproxy/design/main/marks/lockup/zentinel-lockup-dark.svg">
+      <img alt="Zentinel" src="https://raw.githubusercontent.com/zentinelproxy/design/main/marks/lockup/zentinel-lockup-light.svg" height="52">
+    </picture>
+  </a>
+</p>
 
-Authentication and authorization agent for [Zentinel](https://github.com/zentinelproxy/zentinel) reverse proxy. Supports JWT/Bearer tokens, OIDC/OAuth 2.0, API keys, Basic authentication, SAML SSO, mTLS client certificates, and SCIM 2.0 user provisioning.
+<h3 align="center">Auth agent</h3>
 
-## Features
+<p align="center">Checks JWT bearer tokens, API keys and Basic credentials on the request headers, and passes the authenticated identity to the upstream as headers.</p>
 
-### Authentication (AuthN)
-- **JWT/Bearer tokens** - HS256, RS256, ES256 and other algorithms
-- **OIDC/OAuth 2.0** - OpenID Connect with automatic JWKS key rotation
-- **API keys** - Simple header-based authentication
-- **Basic auth** - Username/password authentication
-- **SAML SSO** - Enterprise single sign-on with session persistence
-- **mTLS Client Certificates** - X.509 certificate-based authentication
+<p align="center">
+  <a href="https://github.com/zentinelproxy/zentinel-agent-auth/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/zentinelproxy/zentinel-agent-auth/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-9b4d8a?style=flat&amp;labelColor=1f161e">
+  <img alt="Rust 1.94.1+" src="https://img.shields.io/badge/rust-1.94.1%2B-f68d31?style=flat&amp;labelColor=1f161e&amp;logo=rust&amp;logoColor=white">
+  <img alt="Agent protocol v2" src="https://img.shields.io/badge/agent%20protocol-v2-f68d31?style=flat&amp;labelColor=1f161e">
+</p>
 
-### Authorization (AuthZ)
-- **Cedar Policy Engine** - Basic policy-as-code authorization (principal, action, resource evaluation)
+<p align="center">
+  <a href="https://registry.zentinelproxy.io/auth/">Registry</a> &middot;
+  <a href="https://docs.zentinelproxy.io">Docs</a> &middot;
+  <a href="https://github.com/zentinelproxy">All repositories</a>
+</p>
 
-### Token Services
-- **Token Exchange (RFC 8693)** - Convert between token types (SAML to JWT, external to internal JWT)
+The agent answers Zentinel's `request_headers` event. A request with a valid
+credential is forwarded with `X-User-Id` and `X-Auth-Method` set; a request
+without one gets `401 Unauthorized` with `WWW-Authenticate: Bearer
+realm="zentinel"`. Credentials are set on the command line or through
+environment variables. If the agent is unreachable, the filter's
+`failure-mode` decides: use `"closed"` so an outage blocks requests instead of
+letting them through unauthenticated.
 
-### Provisioning
-- **SCIM 2.0 (RFC 7644)** - Dynamic user provisioning from IdPs (Keycloak, Kanidm, Okta, Azure AD)
-
-### General
-- Configurable user ID and auth method headers
-- Fail-open mode for graceful degradation
-- Comprehensive audit logging
-
-## Documentation
-
-- [Configuration Reference](docs/configuration.md) - Complete configuration options
-- [SAML Authentication](docs/saml.md) - SAML SSO setup and IdP integration
-- [Session Management](docs/session-management.md) - Session persistence and lifecycle
-- [OIDC Authentication](docs/oidc.md) - OIDC/OAuth 2.0 with JWKS
-- [mTLS Authentication](docs/mtls.md) - Client certificate authentication
-- [Authorization](docs/authorization.md) - Cedar policy engine guide
-- [Token Exchange](docs/token-exchange.md) - RFC 8693 token exchange
-- [SCIM Provisioning](docs/scim.md) - SCIM 2.0 user provisioning
-
-## Installation
-
-### Using Cargo
-
-`zentinel-agent-auth` is not published on crates.io, so `cargo install
-zentinel-agent-auth` does not work. Install from the repository instead:
+## Quick start
 
 ```bash
 cargo install --git https://github.com/zentinelproxy/zentinel-agent-auth
+zentinel-auth-agent --socket /tmp/zentinel-auth.sock \
+  --jwt-secret "a-random-secret-of-at-least-32-characters" \
+  --api-keys "sk_live_abc123:production"
 ```
-
-This builds and installs the `zentinel-auth-agent` binary.
-
-### Prebuilt Binaries
-
-The [v0.2.0 release](https://github.com/zentinelproxy/zentinel-agent-auth/releases)
-attaches a single `linux-amd64` binary, still carrying the pre-rename
-`sentinel-auth-agent` name:
-
-```bash
-curl -fsSL -o zentinel-auth-agent \
-  "https://github.com/zentinelproxy/zentinel-agent-auth/releases/download/v0.2.0/sentinel-auth-agent-linux-amd64"
-sudo install -m 0755 zentinel-auth-agent /usr/local/bin/
-```
-
-Other platforms need `cargo install --git` or a source build.
-
-### From source
-
-```bash
-git clone https://github.com/zentinelproxy/zentinel-agent-auth
-cd zentinel-agent-auth
-cargo build --release
-```
-
-## Usage
-
-```bash
-zentinel-auth-agent --socket /var/run/zentinel/auth.sock \
-  --jwt-secret "your-secret-key" \
-  --api-keys "key1:app1,key2:app2"
-```
-
-### Command Line Options
-
-| Option | Environment Variable | Description | Default |
-|--------|---------------------|-------------|---------|
-| `--socket` | `AGENT_SOCKET` | Unix socket path | `/tmp/zentinel-auth.sock` |
-| `--jwt-secret` | `JWT_SECRET` | JWT secret key (for HS256) | - |
-| `--jwt-public-key` | `JWT_PUBLIC_KEY` | JWT public key file (for RS/ES) | - |
-| `--jwt-algorithm` | `JWT_ALGORITHM` | JWT algorithm | `HS256` |
-| `--jwt-issuer` | `JWT_ISSUER` | Required JWT issuer | - |
-| `--jwt-audience` | `JWT_AUDIENCE` | Required JWT audience | - |
-| `--api-keys` | `API_KEYS` | API keys (key:name,key:name) | - |
-| `--api-key-header` | `API_KEY_HEADER` | API key header name | `X-API-Key` |
-| `--basic-auth-users` | `BASIC_AUTH_USERS` | Basic auth users (user:pass) | - |
-| `--user-id-header` | `USER_ID_HEADER` | Header for user ID | `X-User-Id` |
-| `--auth-method-header` | `AUTH_METHOD_HEADER` | Header for auth method | `X-Auth-Method` |
-| `--fail-open` | `FAIL_OPEN` | Allow on auth failure | `false` |
-| `--verbose` | `AUTH_VERBOSE` | Enable debug logging | `false` |
-
-See [Configuration Reference](docs/configuration.md) for OIDC, mTLS, Cedar authorization, token exchange, and SCIM provisioning options.
-
-## Authentication Methods
-
-### JWT/Bearer Token
-
-```bash
-# Configure with HS256 secret
-zentinel-auth-agent --jwt-secret "your-32-char-minimum-secret-key"
-
-# Configure with RS256 public key
-zentinel-auth-agent --jwt-algorithm RS256 --jwt-public-key /path/to/public.pem
-
-# With issuer and audience validation
-zentinel-auth-agent \
-  --jwt-secret "secret" \
-  --jwt-issuer "https://auth.example.com" \
-  --jwt-audience "my-api"
-```
-
-Client request:
-```bash
-curl -H "Authorization: Bearer eyJ..." http://localhost:8080/api
-```
-
-### API Key
-
-```bash
-# Configure API keys
-zentinel-auth-agent --api-keys "sk_live_abc123:production,sk_test_xyz:development"
-```
-
-Client request:
-```bash
-curl -H "X-API-Key: sk_live_abc123" http://localhost:8080/api
-```
-
-### Basic Auth
-
-```bash
-# Configure users
-zentinel-auth-agent --basic-auth-users "admin:secretpass,user:userpass"
-```
-
-Client request:
-```bash
-curl -u "admin:secretpass" http://localhost:8080/api
-```
-
-### OIDC/OAuth 2.0
-
-Configure OIDC with automatic JWKS key fetching and refresh:
 
 ```kdl
-config {
-    oidc {
-        enabled #true
-        issuer "https://auth.example.com"
-        jwks-url "https://auth.example.com/.well-known/jwks.json"
-        audience "my-api"
-        required-scopes "read,write"
+system {
+    worker-threads 0
+}
+
+listeners {
+    listener "http" {
+        address "0.0.0.0:8080"
+        protocol "http"
     }
 }
-```
 
-Client request:
-```bash
-curl -H "Authorization: Bearer <oauth2-access-token>" http://localhost:8080/api
-```
-
-### mTLS Client Certificates
-
-Authenticate clients using X.509 certificates (requires Zentinel proxy to forward client cert):
-
-```kdl
-config {
-    mtls {
-        enabled #true
-        client-cert-header "X-Client-Cert"
-        allowed-dns "CN=service.example.com,O=Example"
-        extract-cn-as-user #true
+upstreams {
+    upstream "backend" {
+        target "127.0.0.1:3000"
     }
 }
-```
 
-The Zentinel proxy forwards the client certificate in a header after TLS termination.
-
-## Authorization
-
-After authentication, requests can be authorized using Cedar policies:
-
-```kdl
-config {
-    authz {
-        enabled #true
-        policy-file "/etc/zentinel/policies/auth.cedar"
-        default-decision "deny"
-    }
-}
-```
-
-Example Cedar policy:
-```cedar
-permit(
-    principal,
-    action == Action::"GET",
-    resource
-) when {
-    resource.path like "/api/public/*"
-};
-
-permit(
-    principal,
-    action,
-    resource
-) when {
-    principal.roles.contains("admin")
-};
-```
-
-See [Authorization Guide](docs/authorization.md) for more details.
-
-## Headers Added
-
-On successful authentication, the agent adds these headers to the request:
-
-| Header | Description | Example |
-|--------|-------------|---------|
-| `X-User-Id` | Authenticated user ID | `user123` |
-| `X-Auth-Method` | Authentication method used | `jwt`, `oidc`, `mtls`, `api_key`, `basic`, `saml` |
-| `X-Auth-Claim-*` | JWT/OIDC claims (for token auth) | `X-Auth-Claim-role: admin` |
-| `X-Client-Cert-*` | Certificate info (for mTLS) | `X-Client-Cert-CN: service.example.com` |
-
-## Configuration
-
-### Zentinel Proxy Configuration
-
-```kdl
 agents {
-    agent "auth" {
-        type "custom"
-        transport "unix_socket" {
-            path "/var/run/zentinel/auth.sock"
-        }
+    agent "auth" type="auth" {
+        unix-socket "/tmp/zentinel-auth.sock"
         events "request_headers"
-        timeout-ms 50
-        failure-mode "open"
+        timeout-ms 100
+    }
+}
+
+filters {
+    filter "auth" {
+        type "agent"
+        agent "auth"
+        failure-mode "closed"
     }
 }
 
 routes {
     route "api" {
-        matches {
-            path-prefix "/api"
-        }
+        matches { path-prefix "/" }
         upstream "backend"
-        agents "auth"
+        filters "auth"
     }
 }
 ```
 
-### Docker/Kubernetes
-
-```yaml
-# Environment variables
-JWT_SECRET: "your-secret-key"
-JWT_ISSUER: "https://auth.example.com"
-API_KEYS: "key1:app1,key2:app2"
-FAIL_OPEN: "false"
+```bash
+curl -H "X-API-Key: sk_live_abc123" http://localhost:8080/   # forwarded, X-User-Id: production
+curl http://localhost:8080/                                   # 401
 ```
 
-## Response Codes
+## Install
 
-| Code | Description |
-|------|-------------|
-| 401 | No valid credentials provided |
-| (passthrough) | Credentials valid, request forwarded |
+Not in the Zentinel bundle yet: the bundle API does not list it, and the
+`v0.2.0` release has no asset in the bundle's naming scheme, so
+`zentinel bundle install auth` fails.
 
-The agent adds `WWW-Authenticate: Bearer realm="zentinel"` header on 401 responses.
+### From source (recommended)
+
+```bash
+cargo install --git https://github.com/zentinelproxy/zentinel-agent-auth
+```
+
+Installs `zentinel-auth-agent`. Needs Rust 1.94.1 or newer and `protoc`; CI
+also installs `pkg-config`, `libxml2-dev` and `libxmlsec1-dev`.
+
+### Container image (build locally)
+
+```bash
+docker build -t zentinel-auth-agent .
+```
+
+## Configuration
+
+Zentinel 0.6.50 does not forward an `agent { config { ... } }` block to
+agents, so configure the agent with the flags below. (The agent also accepts
+configuration over the protocol, `on_configure`, which is the only way to
+reach the modules listed under [How it works](#how-it-works).)
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--socket` | `/tmp/zentinel-auth.sock` | Unix socket to listen on. Env `AGENT_SOCKET`. |
+| `--grpc-address` | unset | Listen on gRPC at this address (e.g. `0.0.0.0:50051`) instead of the socket. Env `GRPC_ADDRESS`. |
+| `--jwt-secret` | unset | Shared secret for HMAC tokens. Takes precedence over `--jwt-public-key`. Env `JWT_SECRET`. |
+| `--jwt-public-key` | unset | PEM file with an RSA or EC public key. Env `JWT_PUBLIC_KEY`. |
+| `--jwt-algorithm` | `HS256` | One of `HS256`, `HS384`, `HS512`, `RS256`, `RS384`, `RS512`, `ES256`, `ES384`. Env `JWT_ALGORITHM`. |
+| `--jwt-issuer` | unset | Required `iss`; not checked when unset. Env `JWT_ISSUER`. |
+| `--jwt-audience` | unset | Required `aud`; not checked when unset. Env `JWT_AUDIENCE`. |
+| `--api-keys` | unset | `key:name` pairs, comma-separated; `name` becomes the user ID. Env `API_KEYS`. |
+| `--api-key-header` | `X-API-Key` | Header that carries the API key. Env `API_KEY_HEADER`. |
+| `--basic-auth-users` | unset | `user:password` pairs, comma-separated. Passwords are compared in plain text. Env `BASIC_AUTH_USERS`. |
+| `--user-id-header` | `X-User-Id` | Request header set to the authenticated user ID. Env `USER_ID_HEADER`. |
+| `--auth-method-header` | `X-Auth-Method` | Request header set to the method used (`jwt`, `api_key`, `basic`, ...). Env `AUTH_METHOD_HEADER`. |
+| `--fail-open` | `false` | Forward requests that fail authentication instead of answering 401. Env `FAIL_OPEN`. |
+| `-v`, `--verbose` | `false` | Debug logging (JSON). Env `AUTH_VERBOSE`. |
+
+On success the agent also sets `X-Auth-Claim-<name>` for every string-valued
+JWT claim (for example `X-Auth-Claim-sub`). It does not remove headers the
+client sent, so with `--fail-open` an unauthenticated request reaches the
+upstream with whatever `X-User-Id` or `X-Auth-Claim-*` headers the client put
+on it. Prefer passing secrets through the environment rather than the command
+line.
+
+Full reference: <https://registry.zentinelproxy.io/auth/>
+
+## How it works
+
+For each request the agent tries, in order: a `Bearer` token as JWT, a
+`Basic` credential, then the API key header. The first that validates wins.
+
+The code also contains these modules. Their settings are read only from
+`on_configure`, which Zentinel 0.6.50 does not send, so none of them can be
+turned on from a Zentinel config today. Treat them as experimental:
+
+- OIDC: bearer tokens checked against a JWKS fetched from a configured URL and refreshed periodically.
+- mTLS identity (partial): reads a PEM certificate from a request header
+  (`X-Client-Cert` by default) and checks its DN and SANs. It does not verify
+  the certificate against a CA, and Zentinel does not set that header, so the
+  header must be set by something you trust.
+- SAML 2.0 SP with sessions stored in redb (partial): the assertion's
+  signature is not verified, so do not rely on it.
+- Cedar authorization (partial): policies see the principal, the HTTP method
+  as the action and the path as the resource, with no entity attributes or
+  context, so policies on roles or claims do not match.
+- RFC 8693 token exchange for JWT subject tokens.
+- SCIM 2.0 user store (redb) that can block deactivated OIDC users.
+
+Notes on these modules are in [`docs/`](docs/); their examples use the
+proxy's `config` block, which is not forwarded.
 
 ## Development
 
 ```bash
-# Run with debug logging
-RUST_LOG=debug cargo run -- \
-  --socket /tmp/test.sock \
-  --jwt-secret "test-secret-at-least-32-characters" \
-  --api-keys "test-key:test-app"
-
-# Run tests
-cargo test
+cargo build
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
 ```
 
-## Security Considerations
+Minimum toolchain: Rust 1.94.1 (`rust-version` in `Cargo.toml`), plus
+`protoc`.
 
-- **Prefer RS256/ES256 over HS256 for JWT** — HS256 uses a shared secret (both signer and verifier must know it). Use asymmetric algorithms (RS256, ES256) in production to avoid sharing secrets across services.
-- Always use strong, random JWT secrets (minimum 32 characters for HS256)
-- Store secrets in environment variables, not command line args
-- Use RS256/ES256 with public keys for production when possible
-- Enable `fail_open` cautiously - only for non-critical paths
-- Consider rate limiting alongside authentication
+## Related
+
+- [Registry page](https://registry.zentinelproxy.io/auth/)
+- [Agent configuration](https://docs.zentinelproxy.io/configuration/agents/)
+- [Agent protocol v2](https://docs.zentinelproxy.io/agents/v2/)
+- [Zentinel](https://github.com/zentinelproxy/zentinel)
 
 ## License
 
-Apache-2.0
+Apache-2.0, see [`LICENSE`](LICENSE).
+
+---
+
+<p align="center">
+  <sub>Part of <a href="https://zentinelproxy.io">Zentinel</a>, the security-first reverse proxy. The shisa guards the gate.</sub>
+</p>
