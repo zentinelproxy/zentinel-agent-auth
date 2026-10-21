@@ -153,17 +153,24 @@ The code also contains these modules. Their settings are read only from
 turned on from a Zentinel config today. Treat them as experimental:
 
 - OIDC: bearer tokens checked against a JWKS fetched from a configured URL and refreshed periodically.
-- mTLS identity (partial): reads a PEM certificate from a request header
-  (`X-Client-Cert` by default) and checks its DN and SANs. It does not verify
-  the certificate against a CA, and Zentinel does not set that header, so the
-  header must be set by something you trust.
-- SAML 2.0 SP with sessions stored in redb (partial): the assertion's
-  signature is not verified, so do not rely on it.
 - Cedar authorization (partial): policies see the principal, the HTTP method
   as the action and the path as the resource, with no entity attributes or
   context, so policies on roles or claims do not match.
-- RFC 8693 token exchange for JWT subject tokens.
 - SCIM 2.0 user store (redb) that can block deactivated OIDC users.
+
+**Refused:** a configuration that enables SAML, mTLS or token exchange is
+rejected whole (`on_configure` returns false, nothing of it is applied),
+because these modules do not verify what they trust
+([#6](https://github.com/zentinelproxy/zentinel-agent-auth/issues/6)):
+
+- SAML does not verify the assertion's XML signature, so a forged response
+  would get a session for any user.
+- mTLS reads a certificate from a request header and never verifies its chain
+  against a CA, so a self-signed certificate would authenticate as any subject.
+- Token exchange issues tokens with whatever scope and audience the caller
+  asks for; `allowed-exchanges` and the scope mapping are not checked.
+
+They stay refused until that verification exists.
 
 Notes on these modules are in [`docs/`](docs/); their examples use the
 proxy's `config` block, which is not forwarded.

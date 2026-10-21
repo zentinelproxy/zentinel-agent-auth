@@ -1,5 +1,10 @@
 # SAML Authentication
 
+> **Disabled.** The agent rejects a configuration that enables this module:
+> it does not verify what it trusts (the assertion's XML signature is not checked). See
+> [zentinel-agent-auth#6](https://github.com/zentinelproxy/zentinel-agent-auth/issues/6).
+> What follows describes the intended design, not something you can turn on.
+
 This guide covers SAML 2.0 Single Sign-On (SSO) configuration for the Zentinel Auth Agent.
 
 ## Overview

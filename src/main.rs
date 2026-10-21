@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -234,6 +234,60 @@ pub struct AuthConfigJson {
     pub scim: ScimConfigJson,
 }
 
+/// Modules that trust an identity, or grant a privilege, they never verify.
+///
+/// Each is refused rather than run until its verification exists:
+///
+/// - **SAML** accepts an assertion without checking its XML signature, so
+///   anyone can post a forged response and get a session for any NameID.
+/// - **mTLS** reads a certificate from a request header and never verifies
+///   its chain against a trust anchor, so a self-signed certificate with any
+///   subject authenticates as that subject.
+/// - **Token exchange** mints tokens signed by this agent's key with whatever
+///   scope and audience the caller asks for: `allowed-exchanges` and the
+///   scope mapping are never checked.
+///
+/// They could only be enabled through the `config { }` block of the agent's
+/// Zentinel configuration, which the proxy did not deliver until
+/// zentinelproxy/zentinel#593. Delivering it would have made them reachable,
+/// so a configuration that enables any of them is now rejected, and nothing
+/// of it is applied. See zentinelproxy/zentinel-agent-auth#6.
+pub const UNVERIFIED_MODULES_ISSUE: &str =
+    "https://github.com/zentinelproxy/zentinel-agent-auth/issues/6";
+
+/// Refuse a configuration that enables a module listed at
+/// [`UNVERIFIED_MODULES_ISSUE`].
+fn refuse_unverified_modules(config: &AuthConfigJson) -> Result<()> {
+    let enabled: Vec<&str> = [
+        ("saml", config.saml.enabled),
+        ("mtls", config.mtls.enabled),
+        ("token-exchange", config.token_exchange.enabled),
+    ]
+    .into_iter()
+    .filter(|(_, enabled)| *enabled == Some(true))
+    .map(|(name, _)| name)
+    .collect();
+
+    if enabled.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "refusing to enable {}: these modules do not verify what they trust \
+         (SAML signatures, mTLS certificate chains, token-exchange grants) and \
+         are disabled until they do; see {}",
+        enabled.join(", "),
+        UNVERIFIED_MODULES_ISSUE
+    ))
+}
+
+/// The error for a module enabled by any path other than `on_configure`.
+fn unverified_module_error(module: &str) -> anyhow::Error {
+    anyhow!(
+        "refusing to enable {module}: it does not verify what it trusts and is \
+         disabled until it does; see {UNVERIFIED_MODULES_ISSUE}"
+    )
+}
+
 impl AuthConfig {
     fn from_args(args: &Args) -> Result<Self> {
         // Parse JWT algorithm
@@ -389,6 +443,9 @@ impl AuthAgent {
     /// Initialize or update SAML provider.
     pub fn configure_saml(&self, config: SamlConfig) -> Result<()> {
         if config.enabled {
+            return Err(unverified_module_error("saml"));
+        }
+        if config.enabled {
             let provider = SamlProvider::new(config.clone())?;
             let mut guard = self
                 .saml_provider
@@ -445,6 +502,9 @@ impl AuthAgent {
 
     /// Configure mTLS.
     pub fn configure_mtls(&self, config: MtlsConfig) -> Result<()> {
+        if config.enabled {
+            return Err(unverified_module_error("mtls"));
+        }
         if let Err(e) = config.validate() {
             return Err(anyhow!("mTLS config validation failed: {}", e));
         }
@@ -498,6 +558,9 @@ impl AuthAgent {
 
     /// Configure token exchange.
     pub fn configure_exchange(&self, config: TokenExchangeConfig) -> Result<()> {
+        if config.enabled {
+            return Err(unverified_module_error("token-exchange"));
+        }
         if config.enabled {
             let issuer = TokenIssuer::new(&config)?;
             let mut guard = self
@@ -1044,6 +1107,10 @@ impl AuthAgent {
 
     /// Reconfigure the agent with new settings
     pub fn reconfigure(&self, json_config: AuthConfigJson) -> Result<()> {
+        // Checked before anything is written: the steps below are applied one
+        // by one, and a refusal halfway would leave a mix of old and new.
+        refuse_unverified_modules(&json_config)?;
+
         let mut config = self
             .config
             .write()
@@ -1428,6 +1495,12 @@ impl AgentHandlerV2 for AuthAgent {
                 return false;
             }
         };
+
+        // Before OIDC, so a refused configuration changes nothing at all.
+        if let Err(e) = refuse_unverified_modules(&json_config) {
+            error!("Configuration rejected: {}", e);
+            return false;
+        }
 
         // Configure OIDC first (async due to JWKS fetch)
         if let Err(e) = self.reconfigure_oidc(&json_config.oidc).await {
@@ -2230,5 +2303,89 @@ mod tests {
 
         let result = agent.authenticate(&headers);
         assert!(result.is_err());
+    }
+
+    // zentinelproxy/zentinel-agent-auth#6: SAML, mTLS and token exchange do
+    // not verify what they trust, and are refused until they do.
+
+    fn refused_configs() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            ("saml", serde_json::json!({ "saml": { "enabled": true } })),
+            ("mtls", serde_json::json!({ "mtls": { "enabled": true } })),
+            (
+                "token-exchange",
+                serde_json::json!({ "token-exchange": { "enabled": true } }),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_configuration_enabling_an_unverified_module_is_rejected_whole() {
+        for (module, mut config) in refused_configs() {
+            // Carries a harmless change too, which must not be applied.
+            config["api-key-header"] = serde_json::json!("X-Changed");
+            let agent = AuthAgent::new(test_config(), None, None);
+
+            assert!(
+                !agent.on_configure(config.clone(), None).await,
+                "{module}: accepted {config}"
+            );
+
+            assert_eq!(
+                agent.config.read().unwrap().api_key_header,
+                "X-API-Key",
+                "{module}: part of a rejected configuration was applied"
+            );
+            assert!(!agent.get_saml_config().unwrap().enabled, "{module}");
+            assert!(!agent.get_mtls_config().unwrap().enabled, "{module}");
+            assert!(!agent.get_exchange_config().unwrap().enabled, "{module}");
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_module_and_the_issue() {
+        for (module, config) in refused_configs() {
+            let config: AuthConfigJson = serde_json::from_value(config).unwrap();
+            let err = refuse_unverified_modules(&config).unwrap_err().to_string();
+            assert!(err.contains(module), "{err}");
+            assert!(err.contains("zentinel-agent-auth/issues/6"), "{err}");
+
+            let agent = AuthAgent::new(test_config(), None, None);
+            let err = agent.reconfigure(config).unwrap_err().to_string();
+            assert!(err.contains(module), "reconfigure: {err}");
+        }
+    }
+
+    #[test]
+    fn enabling_an_unverified_module_directly_is_refused() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let saml = SamlConfig {
+            enabled: true,
+            ..SamlConfig::default()
+        };
+        assert!(agent.configure_saml(saml).is_err());
+        let mtls = MtlsConfig {
+            enabled: true,
+            ..MtlsConfig::default()
+        };
+        assert!(agent.configure_mtls(mtls).is_err());
+        let exchange = TokenExchangeConfig {
+            enabled: true,
+            ..TokenExchangeConfig::default()
+        };
+        assert!(agent.configure_exchange(exchange).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_configuration_leaving_them_off_is_still_accepted() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let config = serde_json::json!({
+            "api-key-header": "X-Changed",
+            "saml": { "enabled": false },
+            "mtls": { "enabled": false },
+            "token-exchange": { "enabled": false },
+        });
+        assert!(agent.on_configure(config, None).await);
+        assert_eq!(agent.config.read().unwrap().api_key_header, "X-Changed");
     }
 }
