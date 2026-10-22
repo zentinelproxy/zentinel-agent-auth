@@ -31,5 +31,10 @@ jobs:
       binary: zentinel-auth-agent
       # The CI jobs install the same packages.
       apt-packages: protobuf-compiler pkg-config libxml2-dev libxmlsec1-dev
+      # samael (SAML) links libxmlsec1 on macOS too.
+      brew-packages: protobuf pkg-config libxmlsec1
+      setup-macos: |
+        echo "LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
+        echo "PKG_CONFIG_PATH=$(brew --prefix)/lib/pkgconfig:$(brew --prefix libxmlsec1)/lib/pkgconfig" >> "$GITHUB_ENV"
       smoke-command: scripts/smoke-test.sh
       harness-ref: v1
