@@ -5,6 +5,7 @@
 //! OIDC/OAuth 2.0, mTLS client certificates, and Cedar policy authorization.
 
 mod authz;
+mod credentials;
 mod exchange;
 mod mtls;
 mod oidc;
@@ -37,6 +38,10 @@ use zentinel_agent_protocol::{
 };
 
 use authz::{AuthzConfig, AuthzConfigJson, AuthzRequest, CedarAuthorizer};
+use credentials::{
+    dummy_bcrypt_check, find_api_key, parse_api_keys, parse_basic_auth_users, ApiKeyInfo,
+    BasicAuthUser, PasswordCheck,
+};
 use exchange::{
     parse_exchange_request, SubjectTokenValidator, TokenExchangeConfig, TokenExchangeConfigJson,
     TokenIssuer, TokenType, ValidatedSubject,
@@ -92,9 +97,13 @@ struct Args {
     #[arg(long, default_value = "X-API-Key", env = "API_KEY_HEADER")]
     api_key_header: String,
 
-    /// Basic auth users (comma-separated user:pass pairs)
+    /// Basic auth users (comma-separated user:bcrypt-hash pairs)
     #[arg(long, env = "BASIC_AUTH_USERS")]
     basic_auth_users: Option<String>,
+
+    /// Accept plain-text Basic auth passwords (not recommended)
+    #[arg(long, env = "BASIC_AUTH_ALLOW_PLAINTEXT")]
+    basic_auth_allow_plaintext: bool,
 
     /// Header to add with user ID
     #[arg(long, default_value = "X-User-Id", env = "USER_ID_HEADER")]
@@ -171,20 +180,6 @@ pub struct JwtClaims {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
-/// API key info
-#[derive(Debug, Clone)]
-pub struct ApiKeyInfo {
-    pub key: String,
-    pub name: String,
-}
-
-/// Basic auth user
-#[derive(Debug, Clone)]
-pub struct BasicAuthUser {
-    pub username: String,
-    pub password_hash: String,
-}
-
 /// Authentication agent configuration
 pub struct AuthConfig {
     pub jwt_secret: Option<Vec<u8>>,
@@ -192,7 +187,7 @@ pub struct AuthConfig {
     pub jwt_algorithm: Algorithm,
     pub jwt_issuer: Option<String>,
     pub jwt_audience: Option<String>,
-    pub api_keys: HashMap<String, ApiKeyInfo>,
+    pub api_keys: Vec<ApiKeyInfo>,
     pub api_key_header: String,
     pub basic_auth_users: HashMap<String, BasicAuthUser>,
     pub user_id_header: String,
@@ -217,9 +212,12 @@ pub struct AuthConfigJson {
     pub api_keys: Vec<String>,
     /// API key header name
     pub api_key_header: Option<String>,
-    /// Basic auth users as user:pass pairs
+    /// Basic auth users as user:bcrypt-hash pairs
     #[serde(default)]
     pub basic_auth_users: Vec<String>,
+    /// Accept plain-text passwords in `basic-auth-users`
+    #[serde(default)]
+    pub basic_auth_allow_plaintext: bool,
     /// Header to add with user ID
     pub user_id_header: Option<String>,
     /// Header to add with auth method
@@ -331,38 +329,19 @@ impl AuthConfig {
         };
 
         // Parse API keys
-        let mut api_keys = HashMap::new();
-        if let Some(keys_str) = &args.api_keys {
-            for pair in keys_str.split(',') {
-                let pair = pair.trim();
-                if let Some((key, name)) = pair.split_once(':') {
-                    api_keys.insert(
-                        key.trim().to_string(),
-                        ApiKeyInfo {
-                            key: key.trim().to_string(),
-                            name: name.trim().to_string(),
-                        },
-                    );
-                }
-            }
-        }
+        let api_keys = args
+            .api_keys
+            .as_deref()
+            .map(|keys| parse_api_keys(keys.split(',')))
+            .unwrap_or_default();
 
         // Parse basic auth users
-        let mut basic_auth_users = HashMap::new();
-        if let Some(users_str) = &args.basic_auth_users {
-            for pair in users_str.split(',') {
-                let pair = pair.trim();
-                if let Some((user, pass)) = pair.split_once(':') {
-                    basic_auth_users.insert(
-                        user.trim().to_string(),
-                        BasicAuthUser {
-                            username: user.trim().to_string(),
-                            password_hash: pass.trim().to_string(),
-                        },
-                    );
-                }
+        let basic_auth_users = match &args.basic_auth_users {
+            Some(users) => {
+                parse_basic_auth_users(users.split(','), args.basic_auth_allow_plaintext)?
             }
-        }
+            None => HashMap::new(),
+        };
 
         Ok(Self {
             jwt_secret,
@@ -1220,6 +1199,8 @@ impl AuthAgent {
             .validate()
             .map_err(|e| anyhow!("OIDC config validation failed: {}", e))?;
 
+        Self::parse_json_basic_auth_users(json_config)?;
+
         let mut authz_config = self.get_authz_config().unwrap_or_default();
         json_config.authz.apply_to(&mut authz_config);
         if authz_config.enabled {
@@ -1239,10 +1220,25 @@ impl AuthAgent {
         Ok(())
     }
 
+    /// The Basic auth users of a configuration, if it sets any.
+    fn parse_json_basic_auth_users(
+        json_config: &AuthConfigJson,
+    ) -> Result<Option<HashMap<String, BasicAuthUser>>> {
+        if json_config.basic_auth_users.is_empty() {
+            return Ok(None);
+        }
+        parse_basic_auth_users(
+            json_config.basic_auth_users.iter().map(String::as_str),
+            json_config.basic_auth_allow_plaintext,
+        )
+        .map(Some)
+    }
+
     /// Reconfigure the agent with new settings
     pub fn reconfigure(&self, json_config: AuthConfigJson) -> Result<()> {
         // Checked before anything is written.
         self.preflight(&json_config)?;
+        let basic_auth_users = Self::parse_json_basic_auth_users(&json_config)?;
 
         let mut config = self
             .config
@@ -1279,18 +1275,7 @@ impl AuthAgent {
 
         // Update API keys
         if !json_config.api_keys.is_empty() {
-            config.api_keys.clear();
-            for pair in json_config.api_keys {
-                if let Some((key, name)) = pair.split_once(':') {
-                    config.api_keys.insert(
-                        key.trim().to_string(),
-                        ApiKeyInfo {
-                            key: key.trim().to_string(),
-                            name: name.trim().to_string(),
-                        },
-                    );
-                }
-            }
+            config.api_keys = parse_api_keys(json_config.api_keys.iter().map(String::as_str));
         }
 
         // Update API key header
@@ -1298,20 +1283,9 @@ impl AuthAgent {
             config.api_key_header = header;
         }
 
-        // Update basic auth users
-        if !json_config.basic_auth_users.is_empty() {
-            config.basic_auth_users.clear();
-            for pair in json_config.basic_auth_users {
-                if let Some((user, pass)) = pair.split_once(':') {
-                    config.basic_auth_users.insert(
-                        user.trim().to_string(),
-                        BasicAuthUser {
-                            username: user.trim().to_string(),
-                            password_hash: pass.trim().to_string(),
-                        },
-                    );
-                }
-            }
+        // Update basic auth users (parsed before the lock was taken)
+        if let Some(users) = basic_auth_users {
+            config.basic_auth_users = users;
         }
 
         // Update headers
@@ -1362,11 +1336,7 @@ impl AuthAgent {
     }
 
     /// Authenticate a request
-    pub fn authenticate(&self, headers: &HashMap<String, Vec<String>>) -> Result<Identity> {
-        let config = self
-            .config
-            .read()
-            .map_err(|_| anyhow!("Failed to acquire read lock"))?;
+    pub async fn authenticate(&self, headers: &HashMap<String, Vec<String>>) -> Result<Identity> {
         // Helper to get first header value (case-insensitive)
         let get_header = |name: &str| -> Option<&str> {
             let name_lower = name.to_lowercase();
@@ -1378,25 +1348,50 @@ impl AuthAgent {
             None
         };
 
-        // 1. Try JWT Bearer token
-        if let Some(auth_header) = get_header("authorization") {
-            if auth_header.starts_with("Bearer ") || auth_header.starts_with("bearer ") {
-                let token = &auth_header[7..];
-                if let Ok(identity) = Self::validate_jwt(&config, token) {
-                    return Ok(identity);
+        let pending_bcrypt = {
+            let config = self
+                .config
+                .read()
+                .map_err(|_| anyhow!("Failed to acquire read lock"))?;
+            let mut pending = None;
+
+            if let Some(auth_header) = get_header("authorization") {
+                // 1. Try JWT Bearer token
+                if auth_header.starts_with("Bearer ") || auth_header.starts_with("bearer ") {
+                    let token = &auth_header[7..];
+                    if let Ok(identity) = Self::validate_jwt(&config, token) {
+                        return Ok(identity);
+                    }
+                }
+
+                // 2. Try Basic auth
+                if auth_header.starts_with("Basic ") || auth_header.starts_with("basic ") {
+                    match Self::check_basic_auth(&config, &auth_header[6..]) {
+                        BasicCheck::Valid(username) => return Ok(basic_identity(&username)),
+                        BasicCheck::Invalid => {}
+                        BasicCheck::NeedsBcrypt(job) => pending = Some(job),
+                    }
                 }
             }
+            pending
+        };
 
-            // 2. Try Basic auth
-            if auth_header.starts_with("Basic ") || auth_header.starts_with("basic ") {
-                let credentials = &auth_header[6..];
-                if let Ok(identity) = Self::validate_basic_auth(&config, credentials) {
-                    return Ok(identity);
-                }
+        // bcrypt takes 100+ ms: run it off the async worker threads.
+        if let Some(job) = pending_bcrypt {
+            let username = job.username.clone();
+            let valid = tokio::task::spawn_blocking(move || job.run())
+                .await
+                .unwrap_or(false);
+            if valid {
+                return Ok(basic_identity(&username));
             }
         }
 
         // 3. Try API key
+        let config = self
+            .config
+            .read()
+            .map_err(|_| anyhow!("Failed to acquire read lock"))?;
         if let Some(api_key) = get_header(&config.api_key_header) {
             if let Ok(identity) = Self::validate_api_key(&config, api_key) {
                 return Ok(identity);
@@ -1457,44 +1452,49 @@ impl AuthAgent {
         })
     }
 
-    /// Validate Basic auth credentials
-    fn validate_basic_auth(config: &AuthConfig, credentials: &str) -> Result<Identity> {
-        let decoded = BASE64
-            .decode(credentials)
-            .context("Invalid base64 in Basic auth")?;
-        let auth_str = String::from_utf8(decoded).context("Invalid UTF-8 in Basic auth")?;
+    /// Check Basic auth credentials as far as possible without bcrypt.
+    fn check_basic_auth(config: &AuthConfig, credentials: &str) -> BasicCheck {
+        let Ok(decoded) = BASE64.decode(credentials.trim()) else {
+            return BasicCheck::Invalid;
+        };
+        let Ok(auth_str) = String::from_utf8(decoded) else {
+            return BasicCheck::Invalid;
+        };
+        let Some((username, password)) = auth_str.split_once(':') else {
+            return BasicCheck::Invalid;
+        };
 
-        let (username, password) = auth_str
-            .split_once(':')
-            .ok_or_else(|| anyhow!("Invalid Basic auth format"))?;
-
-        let user = config
-            .basic_auth_users
-            .get(username)
-            .ok_or_else(|| anyhow!("User not found"))?;
-
-        // Simple password check (in production, use bcrypt or similar)
-        if password != user.password_hash {
-            return Err(anyhow!("Invalid password"));
+        match config.basic_auth_users.get(username) {
+            Some(user) => match user.quick_check(password) {
+                Some(true) => BasicCheck::Valid(username.to_string()),
+                Some(false) => BasicCheck::Invalid,
+                None => BasicCheck::NeedsBcrypt(BcryptJob {
+                    username: username.to_string(),
+                    password: password.to_string(),
+                    user: Some(user.clone()),
+                }),
+            },
+            // An unknown user costs a bcrypt run too when bcrypt users
+            // exist, so timing does not reveal which users exist.
+            None if config
+                .basic_auth_users
+                .values()
+                .any(|u| matches!(u.password, PasswordCheck::Bcrypt(_))) =>
+            {
+                BasicCheck::NeedsBcrypt(BcryptJob {
+                    username: username.to_string(),
+                    password: password.to_string(),
+                    user: None,
+                })
+            }
+            None => BasicCheck::Invalid,
         }
-
-        Ok(Identity {
-            id: username.to_string(),
-            method: AuthMethod::Basic,
-            raw_claims: None,
-            claims: HashMap::from([(
-                "username".to_string(),
-                serde_json::Value::String(username.to_string()),
-            )]),
-        })
     }
 
     /// Validate API key
     fn validate_api_key(config: &AuthConfig, api_key: &str) -> Result<Identity> {
-        let key_info = config
-            .api_keys
-            .get(api_key)
-            .ok_or_else(|| anyhow!("Invalid API key"))?;
+        let key_info =
+            find_api_key(&config.api_keys, api_key).ok_or_else(|| anyhow!("Invalid API key"))?;
 
         Ok(Identity {
             id: key_info.name.clone(),
@@ -1505,6 +1505,45 @@ impl AuthAgent {
                 serde_json::Value::String(key_info.name.clone()),
             )]),
         })
+    }
+}
+
+/// Outcome of checking Basic credentials without bcrypt.
+enum BasicCheck {
+    Valid(String),
+    Invalid,
+    NeedsBcrypt(BcryptJob),
+}
+
+/// A bcrypt verification to run on a blocking thread.
+struct BcryptJob {
+    username: String,
+    password: String,
+    /// `None` for an unknown user: checked against a dummy hash.
+    user: Option<BasicAuthUser>,
+}
+
+impl BcryptJob {
+    fn run(self) -> bool {
+        match self.user {
+            Some(user) => user.bcrypt_check(&self.password),
+            None => {
+                dummy_bcrypt_check(&self.password);
+                false
+            }
+        }
+    }
+}
+
+fn basic_identity(username: &str) -> Identity {
+    Identity {
+        id: username.to_string(),
+        method: AuthMethod::Basic,
+        raw_claims: None,
+        claims: HashMap::from([(
+            "username".to_string(),
+            serde_json::Value::String(username.to_string()),
+        )]),
     }
 }
 
@@ -1902,7 +1941,7 @@ impl AgentHandlerV2 for AuthAgent {
         }
 
         // Try other authentication methods (JWT, API Key, Basic)
-        match self.authenticate(&event.headers) {
+        match self.authenticate(&event.headers).await {
             Ok(identity) => {
                 info!(
                     user_id = %identity.id,
@@ -2381,23 +2420,8 @@ mod tests {
     }
 
     fn test_config() -> AuthConfig {
-        let mut api_keys = HashMap::new();
-        api_keys.insert(
-            "test-key-123".to_string(),
-            ApiKeyInfo {
-                key: "test-key-123".to_string(),
-                name: "test-api".to_string(),
-            },
-        );
-
-        let mut basic_auth_users = HashMap::new();
-        basic_auth_users.insert(
-            "testuser".to_string(),
-            BasicAuthUser {
-                username: "testuser".to_string(),
-                password_hash: "testpass".to_string(),
-            },
-        );
+        let api_keys = parse_api_keys(["test-key-123:test-api"]);
+        let basic_auth_users = parse_basic_auth_users(["testuser:testpass"], true).unwrap();
 
         AuthConfig {
             jwt_secret: Some(b"test-secret-key-at-least-32-chars".to_vec()),
@@ -2414,15 +2438,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_api_key_auth() {
+    #[tokio::test]
+    async fn test_api_key_auth() {
         let config = test_config();
         let agent = AuthAgent::new(config, None, None);
 
         let mut headers = HashMap::new();
         headers.insert("X-API-Key".to_string(), vec!["test-key-123".to_string()]);
 
-        let result = agent.authenticate(&headers);
+        let result = agent.authenticate(&headers).await;
         assert!(result.is_ok());
 
         let identity = result.unwrap();
@@ -2430,8 +2454,8 @@ mod tests {
         assert_eq!(identity.id, "test-api");
     }
 
-    #[test]
-    fn test_basic_auth() {
+    #[tokio::test]
+    async fn test_basic_auth() {
         let config = test_config();
         let agent = AuthAgent::new(config, None, None);
 
@@ -2443,7 +2467,7 @@ mod tests {
             vec![format!("Basic {}", credentials)],
         );
 
-        let result = agent.authenticate(&headers);
+        let result = agent.authenticate(&headers).await;
         assert!(result.is_ok());
 
         let identity = result.unwrap();
@@ -2451,20 +2475,20 @@ mod tests {
         assert_eq!(identity.id, "testuser");
     }
 
-    #[test]
-    fn test_invalid_api_key() {
+    #[tokio::test]
+    async fn test_invalid_api_key() {
         let config = test_config();
         let agent = AuthAgent::new(config, None, None);
 
         let mut headers = HashMap::new();
         headers.insert("X-API-Key".to_string(), vec!["invalid-key".to_string()]);
 
-        let result = agent.authenticate(&headers);
+        let result = agent.authenticate(&headers).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_no_auth() {
+    #[tokio::test]
+    async fn test_no_auth() {
         let config = test_config();
         let agent = AuthAgent::new(config, None, None);
 
@@ -2474,7 +2498,7 @@ mod tests {
             vec!["application/json".to_string()],
         );
 
-        let result = agent.authenticate(&headers);
+        let result = agent.authenticate(&headers).await;
         assert!(result.is_err());
     }
 
@@ -2897,5 +2921,105 @@ mod tests {
             ..AuthzConfig::default()
         };
         assert!(agent.configure_authz(broken).is_err());
+    }
+
+    // Basic auth: bcrypt hashes, plain text only by opt-in; API keys and
+    // passwords compared in constant time.
+
+    // `htpasswd -nbB -C 4 alice s3cret`
+    const ALICE_BCRYPT: &str = "$2y$04$fqtNxPl7APYvfBv0y4Wt5.VI.B4ylGv6lyMXZlI6QCa/JVLPn6zAq";
+
+    fn basic(user: &str, pass: &str) -> HashMap<String, Vec<String>> {
+        HashMap::from([(
+            "authorization".to_string(),
+            vec![format!("Basic {}", BASE64.encode(format!("{user}:{pass}")))],
+        )])
+    }
+
+    #[tokio::test]
+    async fn basic_auth_with_a_bcrypt_hash() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let config = serde_json::json!({
+            "basic-auth-users": [format!("alice:{ALICE_BCRYPT}")]
+        });
+        assert!(agent.on_configure(config, None).await);
+
+        let ok = agent
+            .on_request_headers(request_event("GET", "/", basic("alice", "s3cret")))
+            .await;
+        assert_eq!(block_status(&ok), None);
+        // Again, from the verified cache.
+        let ok = agent
+            .on_request_headers(request_event("GET", "/", basic("alice", "s3cret")))
+            .await;
+        assert_eq!(block_status(&ok), None);
+
+        for (user, pass) in [
+            ("alice", "wrong"),
+            ("alice", ALICE_BCRYPT), // the hash itself is not the password
+            ("bob", "s3cret"),
+            ("testuser", "testpass"), // replaced by the new user list
+        ] {
+            let response = agent
+                .on_request_headers(request_event("GET", "/", basic(user, pass)))
+                .await;
+            assert_eq!(block_status(&response), Some(401), "{user}:{pass}");
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_basic_auth_passwords_need_an_explicit_opt_in() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let config = serde_json::json!({
+            "api-key-header": "X-Changed",
+            "basic-auth-users": ["alice:s3cret"]
+        });
+        assert!(!agent.on_configure(config, None).await);
+        assert_eq!(agent.config.read().unwrap().api_key_header, "X-API-Key");
+
+        let config = serde_json::json!({
+            "basic-auth-users": ["alice:s3cret"],
+            "basic-auth-allow-plaintext": true
+        });
+        assert!(agent.on_configure(config, None).await);
+        assert!(agent.authenticate(&basic("alice", "s3cret")).await.is_ok());
+        assert!(agent.authenticate(&basic("alice", "s3cre")).await.is_err());
+        assert!(agent
+            .authenticate(&basic("alice", "s3cret "))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn plaintext_basic_auth_on_the_command_line_needs_the_flag() {
+        let args = Args::parse_from(["zentinel-auth-agent", "--basic-auth-users", "alice:s3cret"]);
+        let err = AuthConfig::from_args(&args).err().unwrap();
+        assert!(
+            err.to_string().contains("basic-auth-allow-plaintext"),
+            "{err}"
+        );
+
+        let args = Args::parse_from([
+            "zentinel-auth-agent",
+            "--basic-auth-users",
+            "alice:s3cret",
+            "--basic-auth-allow-plaintext",
+        ]);
+        assert!(AuthConfig::from_args(&args).is_ok());
+
+        let hashed = format!("alice:{ALICE_BCRYPT}");
+        let args = Args::parse_from(["zentinel-auth-agent", "--basic-auth-users", &hashed]);
+        assert!(AuthConfig::from_args(&args).is_ok());
+    }
+
+    #[tokio::test]
+    async fn api_keys_are_not_kept_in_plain_text_and_must_match_exactly() {
+        let config = test_config();
+        assert!(!format!("{:?}", config.api_keys).contains("test-key-123"));
+        let agent = AuthAgent::new(config, None, None);
+        for wrong in ["test-key-12", "test-key-1234", "TEST-KEY-123", ""] {
+            let headers = HashMap::from([("X-API-Key".to_string(), vec![wrong.to_string()])]);
+            assert!(agent.authenticate(&headers).await.is_err(), "{wrong}");
+        }
     }
 }

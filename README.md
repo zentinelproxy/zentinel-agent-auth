@@ -126,9 +126,10 @@ reach the modules listed under [How it works](#how-it-works).)
 | `--jwt-algorithm` | `HS256` | One of `HS256`, `HS384`, `HS512`, `RS256`, `RS384`, `RS512`, `ES256`, `ES384`. Env `JWT_ALGORITHM`. |
 | `--jwt-issuer` | unset | Required `iss`; not checked when unset. Env `JWT_ISSUER`. |
 | `--jwt-audience` | unset | Required `aud`; not checked when unset. Env `JWT_AUDIENCE`. |
-| `--api-keys` | unset | `key:name` pairs, comma-separated; `name` becomes the user ID. Env `API_KEYS`. |
+| `--api-keys` | unset | `key:name` pairs, comma-separated; `name` becomes the user ID. Keys are kept only as SHA-256 digests and compared in constant time. Env `API_KEYS`. |
 | `--api-key-header` | `X-API-Key` | Header that carries the API key. Env `API_KEY_HEADER`. |
-| `--basic-auth-users` | unset | `user:password` pairs, comma-separated. Passwords are compared in plain text. Env `BASIC_AUTH_USERS`. |
+| `--basic-auth-users` | unset | `user:hash` pairs, comma-separated, where `hash` is a bcrypt hash (`$2a$`/`$2b$`/`$2y$`, e.g. from `htpasswd -nbB user password`). A plain-text password is refused at startup unless `--basic-auth-allow-plaintext` is set. Env `BASIC_AUTH_USERS`. |
+| `--basic-auth-allow-plaintext` | `false` | Accept plain-text passwords in `--basic-auth-users` (compared in constant time; a warning is logged). Not recommended. Env `BASIC_AUTH_ALLOW_PLAINTEXT`. |
 | `--user-id-header` | `X-User-Id` | Request header set to the authenticated user ID. Env `USER_ID_HEADER`. |
 | `--auth-method-header` | `X-Auth-Method` | Request header set to the method used (`jwt`, `api_key`, `basic`, ...). Env `AUTH_METHOD_HEADER`. |
 | `--fail-open` | `false` | Forward requests that fail authentication instead of answering 401. Env `FAIL_OPEN`. |

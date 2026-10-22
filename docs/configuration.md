@@ -24,14 +24,23 @@ The auth agent can be configured via command-line arguments, environment variabl
 
 | Option | Environment | Description | Default |
 |--------|-------------|-------------|---------|
-| `--api-keys` | `API_KEYS` | API keys as `key:name,key:name` | - |
+| `--api-keys` | `API_KEYS` | API keys as `key:name,key:name` (stored as SHA-256 digests, compared in constant time) | - |
 | `--api-key-header` | `API_KEY_HEADER` | Header name for API key | `X-API-Key` |
 
 ### Basic Auth Configuration
 
 | Option | Environment | Description | Default |
 |--------|-------------|-------------|---------|
-| `--basic-auth-users` | `BASIC_AUTH_USERS` | Users as `user:pass,user:pass` | - |
+| `--basic-auth-users` | `BASIC_AUTH_USERS` | Users as `user:bcrypt-hash,user:bcrypt-hash` | - |
+| `--basic-auth-allow-plaintext` | `BASIC_AUTH_ALLOW_PLAINTEXT` | Also accept plain-text passwords (logged as a warning) | `false` |
+
+Passwords are bcrypt hashes (`$2a$`, `$2b$` or `$2y$`), for example from
+`htpasswd -nbB alice 'her password'` (the part after `alice:`). A password
+that is not a bcrypt hash is refused, at startup or in `on_configure`, unless
+plain text is explicitly allowed. bcrypt runs on a blocking thread, and an
+unknown user costs a bcrypt run too, so response times do not reveal which
+users exist. After a successful login the SHA-256 digest of that password is
+kept in memory, so the same client does not pay for bcrypt on every request.
 
 ### Output Headers
 
@@ -76,7 +85,7 @@ agents {
             api-key-header "X-API-Key"
 
             // Basic auth
-            basic-auth-users "admin:secret,readonly:password"
+            basic-auth-users "admin:$2y$05$.HcI1U00u7WsD57ZPF7srekYacO7PpkJB4VG5R31cAjiK8a5ovGCW"
 
             // Output headers
             user-id-header "X-User-Id"
@@ -108,9 +117,10 @@ agents {
   "jwt-algorithm": "HS256 | RS256 | ES256",
   "jwt-issuer": "string",
   "jwt-audience": "string",
-  "api-keys": "key:name,key:name",
+  "api-keys": ["key:name"],
   "api-key-header": "string",
-  "basic-auth-users": "user:pass,user:pass",
+  "basic-auth-users": ["user:bcrypt-hash"],
+  "basic-auth-allow-plaintext": "boolean (default false)",
   "user-id-header": "string",
   "auth-method-header": "string",
   "fail-open": "boolean",
@@ -342,7 +352,7 @@ export JWT_PUBLIC_KEY="/etc/zentinel/jwt-public.pem"
 export API_KEYS="sk_live_abc123:production,sk_test_xyz:development"
 
 # Basic Auth
-export BASIC_AUTH_USERS="admin:supersecret,readonly:readpass"
+export BASIC_AUTH_USERS='admin:$2y$05$.HcI1U00u7WsD57ZPF7srekYacO7PpkJB4VG5R31cAjiK8a5ovGCW'
 
 # Headers
 export USER_ID_HEADER="X-User-Id"
