@@ -1610,22 +1610,11 @@ impl AgentHandlerV2 for AuthAgent {
         // Get SAML config
         let saml_config = self.get_saml_config().unwrap_or_default();
 
-        // Get request path and method for matching
-        let request_path = event
-            .headers
-            .get("path")
-            .or_else(|| event.headers.get(":path"))
-            .and_then(|v| v.first())
-            .map(|s| s.as_str())
-            .unwrap_or("/");
-
-        let request_method = event
-            .headers
-            .get("method")
-            .or_else(|| event.headers.get(":method"))
-            .and_then(|v| v.first())
-            .map(|s| s.to_uppercase())
-            .unwrap_or_default();
+        // Get request path and method for matching. Zentinel moves the
+        // `:path` and `:method` pseudo-headers into `uri` and `method` and
+        // removes them from `headers`.
+        let (request_path, request_method) = request_target(&event);
+        let request_path = request_path.as_str();
 
         // Check if this is a SCIM provisioning endpoint
         let scim_config = self.get_scim_config().unwrap_or_default();
@@ -2212,6 +2201,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// The request's path (with query) and upper-cased method.
+///
+/// Read from the event's `uri` and `method`, which is where Zentinel puts
+/// them; the `:path`/`path` and `:method`/`method` headers are only a
+/// fallback for senders that leave `uri`/`method` empty.
+fn request_target(event: &RequestHeadersEvent) -> (String, String) {
+    let header = |names: [&str; 2]| {
+        names
+            .iter()
+            .find_map(|n| event.headers.get(*n).and_then(|v| v.first()))
+            .cloned()
+    };
+    let path = if event.uri.is_empty() {
+        header([":path", "path"]).unwrap_or_else(|| "/".to_string())
+    } else {
+        event.uri.clone()
+    };
+    let method = if event.method.is_empty() {
+        header([":method", "method"]).unwrap_or_default()
+    } else {
+        event.method.clone()
+    };
+    (path, method.to_uppercase())
+}
+
 /// Convert a ScimRoute to a string key for body buffering.
 fn route_key(route: &ScimRoute) -> String {
     match route {
@@ -2247,6 +2261,40 @@ fn parse_scim_buffer_key(key: &str) -> Option<ScimRoute> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zentinel_agent_protocol::{Decision, RequestMetadata};
+
+    fn request_event(
+        method: &str,
+        uri: &str,
+        headers: HashMap<String, Vec<String>>,
+    ) -> RequestHeadersEvent {
+        RequestHeadersEvent {
+            metadata: RequestMetadata {
+                correlation_id: "test-correlation".to_string(),
+                request_id: "test-request".to_string(),
+                client_ip: "127.0.0.1".to_string(),
+                client_port: 40000,
+                server_name: None,
+                protocol: "HTTP/1.1".to_string(),
+                tls_version: None,
+                tls_cipher: None,
+                route_id: None,
+                upstream_id: None,
+                timestamp: "2026-10-22T00:00:00Z".to_string(),
+                traceparent: None,
+            },
+            method: method.to_string(),
+            uri: uri.to_string(),
+            headers,
+        }
+    }
+
+    fn block_status(response: &AgentResponse) -> Option<u16> {
+        match response.decision {
+            Decision::Block { status, .. } => Some(status),
+            _ => None,
+        }
+    }
 
     fn test_config() -> AuthConfig {
         let mut api_keys = HashMap::new();
@@ -2504,5 +2552,45 @@ mod tests {
             assert!(agent.authenticate_oidc(&forged).await.is_err());
         }
         assert_eq!(server.hits(), fetches, "unknown kids refetched the JWKS");
+    }
+
+    #[test]
+    fn the_request_target_comes_from_the_event_uri_and_method() {
+        let event = request_event("get", "/scim/v2/Users?count=1", HashMap::new());
+        assert_eq!(
+            request_target(&event),
+            ("/scim/v2/Users?count=1".to_string(), "GET".to_string())
+        );
+
+        let mut headers = HashMap::new();
+        headers.insert(":path".to_string(), vec!["/legacy".to_string()]);
+        headers.insert(":method".to_string(), vec!["post".to_string()]);
+        let event = request_event("", "", headers);
+        assert_eq!(
+            request_target(&event),
+            ("/legacy".to_string(), "POST".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn scim_routes_on_the_event_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(ScimUserStore::open(dir.path().join("scim.redb")).unwrap());
+        let agent = AuthAgent::new(test_config(), None, Some(store));
+        let config = serde_json::json!({
+            "scim": { "enabled": true, "bearer-token": "static-scim-token", "use-oidc-auth": false }
+        });
+        assert!(agent.on_configure(config, None).await);
+
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            vec!["Bearer static-scim-token".to_string()],
+        );
+        // As Zentinel sends it: the path in `uri`, no `:path` header.
+        let response = agent
+            .on_request_headers(request_event("GET", "/scim/v2/Users", headers))
+            .await;
+        assert_eq!(block_status(&response), Some(200));
     }
 }
