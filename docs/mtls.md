@@ -1,5 +1,10 @@
 # mTLS Client Certificate Authentication
 
+> **Disabled.** The agent rejects a configuration that enables this module:
+> it does not verify what it trusts (the certificate chain is never verified against a CA). See
+> [zentinel-agent-auth#6](https://github.com/zentinelproxy/zentinel-agent-auth/issues/6).
+> What follows describes the intended design, not something you can turn on.
+
 The auth agent supports mutual TLS (mTLS) authentication using X.509 client certificates. This enables zero-trust service-to-service authentication.
 
 ## Overview

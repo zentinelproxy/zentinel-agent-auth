@@ -1,5 +1,10 @@
 # Token Exchange (RFC 8693)
 
+> **Disabled.** The agent rejects a configuration that enables this module:
+> it does not verify what it trusts (requested scopes and audiences are issued unchecked). See
+> [zentinel-agent-auth#6](https://github.com/zentinelproxy/zentinel-agent-auth/issues/6).
+> What follows describes the intended design, not something you can turn on.
+
 The auth agent supports OAuth 2.0 Token Exchange as defined in [RFC 8693](https://datatracker.ietf.org/doc/html/rfc8693). This enables exchanging one token type for another.
 
 ## Overview
