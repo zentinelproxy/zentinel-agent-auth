@@ -26,10 +26,10 @@ permissions:
 
 jobs:
   release:
-    uses: zentinelproxy/.github/.github/workflows/agent-release.yml@ci/agent-release
+    uses: zentinelproxy/.github/.github/workflows/agent-release.yml@v1
     with:
       binary: zentinel-auth-agent
       # The CI jobs install the same packages.
       apt-packages: protobuf-compiler pkg-config libxml2-dev libxmlsec1-dev
       smoke-command: scripts/smoke-test.sh
-      harness-ref: ci/agent-release
+      harness-ref: v1
