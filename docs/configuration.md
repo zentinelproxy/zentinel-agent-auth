@@ -321,7 +321,7 @@ See [SCIM Provisioning](scim.md) for detailed guide and IdP setup instructions.
 | `base-path` | string | `/scim/v2` | Base path for SCIM endpoints |
 | `bearer-token` | string | - | Static bearer token for SCIM auth |
 | `use-oidc-auth` | bool | `true` | Use OIDC token validation for SCIM auth |
-| `required-scope` | string | - | Required OAuth scope (e.g. `scim:write`) |
+| `required-scope` | string | `scim` | Scope an OIDC token must carry to use SCIM. Cannot be empty while `use-oidc-auth` is on |
 | `store-path` | string | `/var/lib/zentinel-auth/scim_users.redb` | Path to SCIM user database |
 | `enforce-active-status` | bool | `true` | Block deactivated SCIM users during OIDC auth |
 | `location-base-url` | string | - | Base URL for `meta.location` URLs |

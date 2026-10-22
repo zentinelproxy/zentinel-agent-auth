@@ -98,7 +98,11 @@ When `enforce-active-status` is enabled, deactivated SCIM users are automaticall
 }
 ```
 
-This reuses the existing OIDC validator — no additional configuration needed if OIDC is already set up.
+This reuses the existing OIDC validator. A valid OIDC token is not enough on
+its own: it must also carry the scope in `required-scope` (default `scim`),
+otherwise any user who can log in at the IdP could create, change and delete
+users. A token without it gets `403`. A configuration with `use-oidc-auth`
+on and an empty `required-scope` is rejected.
 
 ### Complete Configuration
 
@@ -150,7 +154,7 @@ agents {
 | `base-path` | string | `/scim/v2` | Base path for SCIM endpoints |
 | `bearer-token` | string | - | Static bearer token for SCIM auth |
 | `use-oidc-auth` | bool | `true` | Use OIDC token validation for SCIM auth |
-| `required-scope` | string | - | Required OAuth scope (e.g. `scim:write`) |
+| `required-scope` | string | `scim` | Scope an OIDC token must carry to use SCIM. Cannot be empty while `use-oidc-auth` is on |
 | `store-path` | string | `/var/lib/zentinel-auth/scim_users.redb` | Path to SCIM user database file |
 | `enforce-active-status` | bool | `true` | Block deactivated SCIM users during OIDC auth |
 | `location-base-url` | string | - | Base URL for `meta.location` (defaults to `base-path`) |
@@ -160,11 +164,13 @@ agents {
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `SCIM_STORE_PATH` | Path to SCIM user database | `/var/lib/zentinel-auth/scim_users.redb` |
-| `SCIM_BEARER_TOKEN` | Static bearer token (alternative to config) | - |
 
 ## SCIM Endpoints
 
-All endpoints require authentication via bearer token (static or OIDC).
+All endpoints require authentication: the static bearer token (compared in
+constant time), or an OIDC token that carries `required-scope`. A missing or
+invalid credential gets `401`; a valid OIDC token without the scope gets
+`403`.
 
 ### Create User
 
@@ -303,6 +309,7 @@ Returns 204 No Content. The user is deactivated (set `active: false`) rather tha
 | 204 | User deleted (DELETE) |
 | 400 | Invalid request body, unsupported filter, or bad patch operation |
 | 401 | Missing or invalid bearer token |
+| 403 | OIDC token without `required-scope` |
 | 404 | User not found |
 | 409 | `userName` conflict (uniqueness violation) |
 | 503 | SCIM store not initialized |
@@ -387,7 +394,7 @@ An in-memory cache mirrors all three tables for fast reads. The cache is populat
 ## Security Considerations
 
 1. **Use strong bearer tokens** — Generate a random token of at least 32 characters. Treat it like a password.
-2. **Prefer OIDC auth in production** — Set `use-oidc-auth: true` and `required-scope: "scim:write"` so only authorized service accounts can provision users.
+2. **Prefer OIDC auth in production** — With `use-oidc-auth: true`, only tokens carrying `required-scope` (default `scim`) may provision users. Grant that scope only to the IdP's provisioning client. Set `use-oidc-auth: false` if only the static token should work.
 3. **Restrict network access** — SCIM endpoints should only be accessible from your IdP. Use firewall rules or Zentinel route matching to limit access.
 4. **Enable `enforce-active-status`** — This blocks deactivated users during OIDC auth, ensuring that deprovisioning in your IdP immediately revokes access.
 5. **Separate database file** — The SCIM store uses a separate file from the SAML session store. Back it up as part of your data management strategy.

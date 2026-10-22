@@ -24,8 +24,10 @@ pub struct ScimConfig {
     #[serde(default = "default_true")]
     pub use_oidc_auth: bool,
 
-    /// Required OAuth scope for SCIM operations (e.g. "scim:write").
-    #[serde(default)]
+    /// OAuth scope an OIDC token must carry to use the SCIM endpoint.
+    /// Defaults to `scim`; it cannot be empty while `use_oidc_auth` is on,
+    /// because any user who can log in would otherwise manage users.
+    #[serde(default = "default_required_scope")]
     pub required_scope: Option<String>,
 
     /// Path to the SCIM user store (redb database file).
@@ -51,6 +53,13 @@ fn default_store_path() -> String {
     "/var/lib/sentinel-auth/scim_users.redb".to_string()
 }
 
+/// Scope an OIDC token needs for SCIM unless configured otherwise.
+pub const DEFAULT_SCIM_SCOPE: &str = "scim";
+
+fn default_required_scope() -> Option<String> {
+    Some(DEFAULT_SCIM_SCOPE.to_string())
+}
+
 fn default_true() -> bool {
     true
 }
@@ -62,7 +71,7 @@ impl Default for ScimConfig {
             base_path: default_base_path(),
             bearer_token: None,
             use_oidc_auth: true,
-            required_scope: None,
+            required_scope: default_required_scope(),
             store_path: default_store_path(),
             enforce_active_status: true,
             location_base_url: None,
@@ -84,6 +93,15 @@ impl ScimConfig {
             );
         }
 
+        // OIDC tokens prove who the caller is, not that they may administer
+        // users: without a scope, every user of the IdP could.
+        if self.use_oidc_auth && self.oidc_scope().is_none() {
+            return Err(
+                "SCIM use_oidc_auth requires a non-empty required_scope (default \"scim\")"
+                    .to_string(),
+            );
+        }
+
         // Base path must start with /
         if !self.base_path.starts_with('/') {
             return Err(format!(
@@ -98,6 +116,14 @@ impl ScimConfig {
         }
 
         Ok(())
+    }
+
+    /// The scope an OIDC token needs, if a non-empty one is configured.
+    pub fn oidc_scope(&self) -> Option<&str> {
+        self.required_scope
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     /// Get the effective base URL for meta.location generation.
@@ -172,6 +198,29 @@ mod tests {
         assert!(config.use_oidc_auth);
         assert!(config.enforce_active_status);
         assert_eq!(config.store_path, "/var/lib/sentinel-auth/scim_users.redb");
+        assert_eq!(config.oidc_scope(), Some(DEFAULT_SCIM_SCOPE));
+    }
+
+    #[test]
+    fn oidc_auth_without_a_scope_is_rejected() {
+        for scope in [None, Some(String::new()), Some("  ".to_string())] {
+            let config = ScimConfig {
+                enabled: true,
+                use_oidc_auth: true,
+                required_scope: scope.clone(),
+                ..Default::default()
+            };
+            assert!(config.validate().is_err(), "{scope:?}");
+        }
+        // Static-token-only SCIM does not need a scope.
+        let config = ScimConfig {
+            enabled: true,
+            use_oidc_auth: false,
+            bearer_token: Some("t".to_string()),
+            required_scope: None,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]

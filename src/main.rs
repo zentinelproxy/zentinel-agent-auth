@@ -10,6 +10,7 @@ mod mtls;
 mod oidc;
 mod saml;
 mod scim;
+mod secret;
 mod session;
 
 use anyhow::{anyhow, Context, Result};
@@ -368,6 +369,14 @@ impl AuthConfig {
     }
 }
 
+/// Outcome of authenticating a SCIM request.
+#[derive(Debug, PartialEq, Eq)]
+enum ScimAuth {
+    Allowed,
+    Unauthenticated,
+    MissingScope,
+}
+
 /// Authentication agent
 pub struct AuthAgent {
     config: RwLock<AuthConfig>,
@@ -646,7 +655,7 @@ impl AuthAgent {
 
         let scim_config = self.get_scim_config()?;
         if let Some(ref expected) = scim_config.bearer_token {
-            if token == expected {
+            if secret::secrets_equal(token.as_bytes(), expected.as_bytes()) {
                 return Ok(());
             }
         }
@@ -685,6 +694,13 @@ impl AuthAgent {
 
     /// Try to authenticate via OIDC token.
     async fn authenticate_oidc(&self, token: &str) -> Result<Identity> {
+        self.authenticate_oidc_with_scopes(token)
+            .await
+            .map(|(identity, _)| identity)
+    }
+
+    /// Authenticate via OIDC token, also returning the token's scopes.
+    async fn authenticate_oidc_with_scopes(&self, token: &str) -> Result<(Identity, Vec<String>)> {
         let oidc_config = self.get_oidc_config()?;
 
         if !oidc_config.enabled {
@@ -710,11 +726,56 @@ impl AuthAgent {
             claims.insert(k, serde_json::Value::String(v));
         }
 
-        Ok(Identity {
-            id: identity.user_id,
-            method: AuthMethod::Oidc,
-            claims,
-        })
+        Ok((
+            Identity {
+                id: identity.user_id,
+                method: AuthMethod::Oidc,
+                claims,
+            },
+            identity.scopes,
+        ))
+    }
+
+    /// Authenticate a request to the SCIM endpoint: the static bearer token,
+    /// or (with `use-oidc-auth`) an OIDC token carrying the SCIM scope.
+    async fn authorize_scim(
+        &self,
+        scim_config: &ScimConfig,
+        auth_header: Option<&str>,
+    ) -> ScimAuth {
+        let Some(header) = auth_header else {
+            return ScimAuth::Unauthenticated;
+        };
+        if self.validate_scim_bearer_token(header).is_ok() {
+            return ScimAuth::Allowed;
+        }
+        if !scim_config.use_oidc_auth {
+            return ScimAuth::Unauthenticated;
+        }
+        let Some(token) = header
+            .strip_prefix("Bearer ")
+            .or_else(|| header.strip_prefix("bearer "))
+        else {
+            return ScimAuth::Unauthenticated;
+        };
+        let (identity, scopes) = match self.authenticate_oidc_with_scopes(token).await {
+            Ok(v) => v,
+            Err(_) => return ScimAuth::Unauthenticated,
+        };
+        // Refused by validate(), but never treat a missing scope as "any".
+        let Some(required) = scim_config.oidc_scope() else {
+            return ScimAuth::MissingScope;
+        };
+        if scopes.iter().any(|s| s == required) {
+            ScimAuth::Allowed
+        } else {
+            warn!(
+                user = %identity.id,
+                required_scope = %required,
+                "SCIM request refused: OIDC token lacks the SCIM scope"
+            );
+            ScimAuth::MissingScope
+        }
     }
 
     /// Handle token exchange request body.
@@ -1140,6 +1201,14 @@ impl AuthAgent {
         oidc_config
             .validate()
             .map_err(|e| anyhow!("OIDC config validation failed: {}", e))?;
+
+        let mut scim_config = self.get_scim_config().unwrap_or_default();
+        json_config.scim.apply_to(&mut scim_config);
+        if scim_config.enabled {
+            scim_config
+                .validate()
+                .map_err(|e| anyhow!("SCIM config validation failed: {}", e))?;
+        }
 
         Ok(())
     }
@@ -1629,29 +1698,15 @@ impl AgentHandlerV2 for AuthAgent {
                 .and_then(|(_, v)| v.first())
                 .cloned();
 
-            let scim_authed = match auth_header {
-                Some(ref header) => {
-                    // Try static bearer token first
-                    if self.validate_scim_bearer_token(header).is_ok() {
-                        true
-                    } else if scim_config.use_oidc_auth {
-                        // Try OIDC validation
-                        let token =
-                            if header.starts_with("Bearer ") || header.starts_with("bearer ") {
-                                &header[7..]
-                            } else {
-                                ""
-                            };
-                        self.authenticate_oidc(token).await.is_ok()
-                    } else {
-                        false
-                    }
+            match self
+                .authorize_scim(&scim_config, auth_header.as_deref())
+                .await
+            {
+                ScimAuth::Allowed => {}
+                ScimAuth::Unauthenticated => return scim_error_response(401, "Unauthorized"),
+                ScimAuth::MissingScope => {
+                    return scim_error_response(403, "Token lacks the required SCIM scope")
                 }
-                None => false,
-            };
-
-            if !scim_authed {
-                return scim_error_response(401, "Unauthorized");
             }
 
             // Route the request
@@ -2592,5 +2647,104 @@ mod tests {
             .on_request_headers(request_event("GET", "/scim/v2/Users", headers))
             .await;
         assert_eq!(block_status(&response), Some(200));
+    }
+
+    // SCIM: an OIDC token proves identity, not the right to manage users.
+
+    fn scim_agent_config(jwks_url: &str) -> serde_json::Value {
+        let mut config = oidc_json(jwks_url);
+        config["scim"] = serde_json::json!({
+            "enabled": true,
+            "bearer-token": "static-scim-token",
+        });
+        config
+    }
+
+    async fn scim_auth_for(agent: &AuthAgent, header: Option<&str>) -> ScimAuth {
+        let scim_config = agent.get_scim_config().unwrap();
+        agent.authorize_scim(&scim_config, header).await
+    }
+
+    #[tokio::test]
+    async fn scim_refuses_an_oidc_token_without_the_scim_scope() {
+        use oidc::test_support::*;
+        let server = JwksServer::start().await;
+        let agent = AuthAgent::new(test_config(), None, None);
+        assert!(
+            agent
+                .on_configure(scim_agent_config(&server.url()), None)
+                .await
+        );
+
+        let plain_user = sign_rsa(
+            Algorithm::RS256,
+            Some(TEST_KID),
+            &test_claims("alice", serde_json::json!({ "scope": "openid profile" })),
+        );
+        // The token itself is valid for normal requests...
+        assert!(agent.authenticate_oidc(&plain_user).await.is_ok());
+        // ...but not for SCIM.
+        assert_eq!(
+            scim_auth_for(&agent, Some(&format!("Bearer {plain_user}"))).await,
+            ScimAuth::MissingScope
+        );
+
+        let admin = sign_rsa(
+            Algorithm::RS256,
+            Some(TEST_KID),
+            &test_claims("provisioner", serde_json::json!({ "scope": "openid scim" })),
+        );
+        assert_eq!(
+            scim_auth_for(&agent, Some(&format!("Bearer {admin}"))).await,
+            ScimAuth::Allowed
+        );
+
+        // Through the request path: 403 for the plain user.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            vec![format!("Bearer {plain_user}")],
+        );
+        let response = agent
+            .on_request_headers(request_event("GET", "/scim/v2/Users", headers))
+            .await;
+        assert_eq!(block_status(&response), Some(403));
+    }
+
+    #[tokio::test]
+    async fn scim_static_token_is_compared_exactly() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        assert!(
+            agent
+                .on_configure(scim_agent_config("https://issuer.test/jwks.json"), None)
+                .await
+        );
+        assert_eq!(
+            scim_auth_for(&agent, Some("Bearer static-scim-token")).await,
+            ScimAuth::Allowed
+        );
+        for wrong in [
+            "Bearer static-scim-tokeN",
+            "Bearer static-scim-token2",
+            "Bearer ",
+            "static-scim-token",
+        ] {
+            assert_eq!(
+                scim_auth_for(&agent, Some(wrong)).await,
+                ScimAuth::Unauthenticated,
+                "{wrong}"
+            );
+        }
+        assert_eq!(scim_auth_for(&agent, None).await, ScimAuth::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn scim_with_oidc_and_an_empty_scope_rejects_the_configuration() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let mut config = scim_agent_config("https://issuer.test/jwks.json");
+        config["scim"]["required-scope"] = serde_json::json!("");
+        assert!(!agent.on_configure(config, None).await);
+        assert!(!agent.get_scim_config().unwrap().enabled);
+        assert!(!agent.get_oidc_config().unwrap().enabled, "partly applied");
     }
 }

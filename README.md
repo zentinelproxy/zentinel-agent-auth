@@ -159,7 +159,9 @@ turned on from a Zentinel config today. Treat them as experimental:
 - Cedar authorization (partial): policies see the principal, the HTTP method
   as the action and the path as the resource, with no entity attributes or
   context, so policies on roles or claims do not match.
-- SCIM 2.0 user store (redb) that can block deactivated OIDC users.
+- SCIM 2.0 user store (redb) that can block deactivated OIDC users. Its
+  endpoint takes the static bearer token (compared in constant time) or an
+  OIDC token carrying `required-scope` (default `scim`; cannot be empty).
 
 **Refused:** a configuration that enables SAML, mTLS or token exchange is
 rejected whole (`on_configure` returns false, nothing of it is applied),
