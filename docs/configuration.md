@@ -173,6 +173,9 @@ See [OIDC Authentication](oidc.md) for detailed setup guide.
 | `audience` | string | - | Expected audience claim |
 | `required-scopes` | array | `[]` | Scopes that must be present |
 | `jwks-refresh-secs` | int | `3600` | JWKS cache refresh interval |
+| `jwks-min-refetch-secs` | int | `60` | Minimum time between JWKS fetches (unknown `kid`s do not refetch more often) |
+| `jwks-fetch-timeout-ms` | int | `5000` | Timeout for one JWKS fetch; configuring never waits for it |
+| `allowed-algorithms` | array | `[]` | Allowed token algorithms; empty means those the JWKS keys declare. `none`/`HS*` are rejected |
 | `clock-skew-secs` | int | `30` | Clock skew tolerance |
 
 ## mTLS Configuration

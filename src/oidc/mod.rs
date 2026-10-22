@@ -7,6 +7,9 @@ pub mod config;
 pub mod jwks;
 pub mod validator;
 
+#[cfg(test)]
+pub mod test_support;
+
 pub use config::{OidcConfig, OidcConfigJson};
-pub use jwks::JwksCache;
+pub use jwks::{JwksCache, JwksSettings};
 pub use validator::validate_oidc_token;

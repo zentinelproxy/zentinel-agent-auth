@@ -1,6 +1,8 @@
 //! OIDC configuration.
 
+use jsonwebtoken::Algorithm;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// OIDC/OAuth 2.0 configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +45,52 @@ pub struct OidcConfig {
     /// Claim containing scopes. Defaults to "scope".
     #[serde(default = "default_scope_claim")]
     pub scope_claim: String,
+
+    /// Signature algorithms a token may use. Empty means the asymmetric
+    /// algorithms the JWKS keys declare (`RS256`, `ES256` or `ES384` for a
+    /// key that declares none). `none` and the symmetric `HS*` algorithms
+    /// are always refused.
+    #[serde(default)]
+    pub allowed_algorithms: Vec<String>,
+
+    /// Minimum seconds between two JWKS fetches. A token with an unknown
+    /// `kid` triggers at most one refetch per interval; unknown key IDs are
+    /// remembered as unknown until the next fetch.
+    #[serde(default = "default_jwks_min_refetch")]
+    pub jwks_min_refetch_secs: u64,
+
+    /// Timeout for one JWKS fetch, in milliseconds.
+    #[serde(default = "default_jwks_fetch_timeout")]
+    pub jwks_fetch_timeout_ms: u64,
+}
+
+/// Longest JWKS fetch timeout accepted, in milliseconds.
+pub const MAX_JWKS_FETCH_TIMEOUT_MS: u64 = 30_000;
+
+/// Parse a JWS algorithm name that may verify a token against a JWKS public
+/// key.
+///
+/// `none` is refused, and so are the `HS*` algorithms: with a public key as
+/// the HMAC secret, anyone holding the public key could sign tokens
+/// (algorithm confusion). Only the algorithms the JWKS loader can build keys
+/// for are accepted.
+pub fn parse_asymmetric_algorithm(name: &str) -> Result<Algorithm, String> {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "RS256" => Ok(Algorithm::RS256),
+        "RS384" => Ok(Algorithm::RS384),
+        "RS512" => Ok(Algorithm::RS512),
+        "PS256" => Ok(Algorithm::PS256),
+        "PS384" => Ok(Algorithm::PS384),
+        "PS512" => Ok(Algorithm::PS512),
+        "ES256" => Ok(Algorithm::ES256),
+        "ES384" => Ok(Algorithm::ES384),
+        "NONE" => Err("algorithm `none` (unsigned tokens) is never accepted".to_string()),
+        "HS256" | "HS384" | "HS512" => Err(format!(
+            "symmetric algorithm `{name}` cannot verify tokens against JWKS public keys \
+             (algorithm confusion); use RS*, PS* or ES*"
+        )),
+        _ => Err(format!("unsupported OIDC signature algorithm `{name}`")),
+    }
 }
 
 fn default_jwks_refresh() -> u64 {
@@ -61,6 +109,14 @@ fn default_scope_claim() -> String {
     "scope".to_string()
 }
 
+fn default_jwks_min_refetch() -> u64 {
+    60
+}
+
+fn default_jwks_fetch_timeout() -> u64 {
+    5_000
+}
+
 impl Default for OidcConfig {
     fn default() -> Self {
         Self {
@@ -73,6 +129,9 @@ impl Default for OidcConfig {
             clock_skew_secs: default_clock_skew(),
             user_id_claim: default_user_claim(),
             scope_claim: default_scope_claim(),
+            allowed_algorithms: Vec::new(),
+            jwks_min_refetch_secs: default_jwks_min_refetch(),
+            jwks_fetch_timeout_ms: default_jwks_fetch_timeout(),
         }
     }
 }
@@ -80,8 +139,23 @@ impl Default for OidcConfig {
 impl OidcConfig {
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), String> {
+        // Checked even when disabled: a list naming `none` or HS* is never
+        // what anyone wants, and enabling later must not be the first check.
+        self.explicit_allowed_algorithms()?;
+
         if !self.enabled {
             return Ok(());
+        }
+
+        if self.jwks_min_refetch_secs == 0 {
+            return Err("OIDC jwks-min-refetch-secs must be at least 1".to_string());
+        }
+
+        if self.jwks_fetch_timeout_ms == 0 || self.jwks_fetch_timeout_ms > MAX_JWKS_FETCH_TIMEOUT_MS
+        {
+            return Err(format!(
+                "OIDC jwks-fetch-timeout-ms must be between 1 and {MAX_JWKS_FETCH_TIMEOUT_MS}"
+            ));
         }
 
         if self.issuer.is_empty() {
@@ -99,6 +173,22 @@ impl OidcConfig {
 
         Ok(())
     }
+
+    /// The configured `allowed-algorithms`, parsed. `None` when the list is
+    /// empty, meaning "whatever the JWKS keys declare".
+    pub fn explicit_allowed_algorithms(&self) -> Result<Option<HashSet<Algorithm>>, String> {
+        if self.allowed_algorithms.is_empty() {
+            return Ok(None);
+        }
+        self.allowed_algorithms
+            .iter()
+            .map(|name| {
+                parse_asymmetric_algorithm(name)
+                    .map_err(|e| format!("OIDC allowed-algorithms: {e}"))
+            })
+            .collect::<Result<HashSet<_>, _>>()
+            .map(Some)
+    }
 }
 
 /// JSON configuration for dynamic reconfiguration.
@@ -115,6 +205,10 @@ pub struct OidcConfigJson {
     pub clock_skew_secs: Option<i64>,
     pub user_id_claim: Option<String>,
     pub scope_claim: Option<String>,
+    #[serde(default)]
+    pub allowed_algorithms: Vec<String>,
+    pub jwks_min_refetch_secs: Option<u64>,
+    pub jwks_fetch_timeout_ms: Option<u64>,
 }
 
 impl OidcConfigJson {
@@ -146,6 +240,15 @@ impl OidcConfigJson {
         }
         if let Some(ref claim) = self.scope_claim {
             config.scope_claim = claim.clone();
+        }
+        if !self.allowed_algorithms.is_empty() {
+            config.allowed_algorithms = self.allowed_algorithms.clone();
+        }
+        if let Some(secs) = self.jwks_min_refetch_secs {
+            config.jwks_min_refetch_secs = secs;
+        }
+        if let Some(ms) = self.jwks_fetch_timeout_ms {
+            config.jwks_fetch_timeout_ms = ms;
         }
     }
 }
@@ -191,6 +294,7 @@ mod tests {
             clock_skew_secs: None,
             user_id_claim: None,
             scope_claim: None,
+            ..Default::default()
         };
 
         json.apply_to(&mut config);
@@ -201,5 +305,49 @@ mod tests {
         assert_eq!(config.required_scopes, vec!["read", "write"]);
         assert_eq!(config.jwks_refresh_secs, 1800);
         assert_eq!(config.clock_skew_secs, 30); // unchanged
+    }
+
+    #[test]
+    fn allowed_algorithms_refuse_none_and_symmetric() {
+        for bad in ["none", "None", "HS256", "hs384", "HS512"] {
+            let config = OidcConfig {
+                allowed_algorithms: vec!["RS256".to_string(), bad.to_string()],
+                ..Default::default()
+            };
+            let err = config.validate().unwrap_err();
+            assert!(err.contains("allowed-algorithms"), "{bad}: {err}");
+        }
+
+        let config = OidcConfig {
+            allowed_algorithms: vec!["RS256".to_string(), "es256".to_string()],
+            ..Default::default()
+        };
+        let algs = config.explicit_allowed_algorithms().unwrap().unwrap();
+        assert!(algs.contains(&Algorithm::RS256) && algs.contains(&Algorithm::ES256));
+        assert!(OidcConfig::default()
+            .explicit_allowed_algorithms()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn refetch_and_timeout_bounds_are_validated() {
+        let base = OidcConfig {
+            enabled: true,
+            issuer: "https://auth.example.com".to_string(),
+            jwks_url: "https://auth.example.com/jwks".to_string(),
+            ..Default::default()
+        };
+        assert!(base.validate().is_ok());
+        let zero_refetch = OidcConfig {
+            jwks_min_refetch_secs: 0,
+            ..base.clone()
+        };
+        assert!(zero_refetch.validate().is_err());
+        let long_timeout = OidcConfig {
+            jwks_fetch_timeout_ms: MAX_JWKS_FETCH_TIMEOUT_MS + 1,
+            ..base
+        };
+        assert!(long_timeout.validate().is_err());
     }
 }

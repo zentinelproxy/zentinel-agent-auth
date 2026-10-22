@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,7 +41,7 @@ use exchange::{
     TokenIssuer, TokenType, ValidatedSubject,
 };
 use mtls::{validate_client_cert, MtlsConfig, MtlsConfigJson};
-use oidc::{validate_oidc_token, JwksCache, OidcConfig, OidcConfigJson};
+use oidc::{validate_oidc_token, JwksCache, JwksSettings, OidcConfig, OidcConfigJson};
 use saml::{SamlConfig, SamlConfigJson, SamlProvider};
 use scim::{
     handle_scim_body, handle_scim_delete, handle_scim_get, match_scim_route, scim_error_response,
@@ -472,15 +473,36 @@ impl AuthAgent {
     }
 
     /// Configure OIDC provider.
-    pub async fn configure_oidc(&self, config: OidcConfig) -> Result<()> {
-        if config.enabled {
-            let cache = JwksCache::new(config.jwks_url.clone(), config.jwks_refresh_secs).await?;
+    ///
+    /// Never waits for the JWKS endpoint: the keys are fetched in a
+    /// background task with a bounded timeout, and tokens are rejected until
+    /// they have loaded.
+    pub fn configure_oidc(&self, config: OidcConfig) -> Result<()> {
+        config
+            .validate()
+            .map_err(|e| anyhow!("OIDC config validation failed: {}", e))?;
+
+        let cache = if config.enabled {
+            let cache = Arc::new(JwksCache::new(
+                config.jwks_url.clone(),
+                JwksSettings {
+                    refresh_interval: Duration::from_secs(config.jwks_refresh_secs),
+                    min_refetch_interval: Duration::from_secs(config.jwks_min_refetch_secs),
+                    fetch_timeout: Duration::from_millis(config.jwks_fetch_timeout_ms),
+                },
+            )?);
+            cache.spawn_refresh();
+            info!(issuer = %config.issuer, "OIDC configured");
+            Some(cache)
+        } else {
+            None
+        };
+        {
             let mut guard = self
                 .jwks_cache
                 .write()
                 .map_err(|_| anyhow!("JWKS cache lock poisoned"))?;
-            *guard = Some(Arc::new(cache));
-            info!(issuer = %config.issuer, "OIDC configured");
+            *guard = cache;
         }
 
         let mut oidc_cfg = self
@@ -681,7 +703,7 @@ impl AuthAgent {
                 .clone()
         };
 
-        let identity = validate_oidc_token(&oidc_config, jwks.as_ref(), token).await?;
+        let identity = validate_oidc_token(&oidc_config, &jwks, token).await?;
 
         let mut claims = HashMap::new();
         for (k, v) in identity.claims {
@@ -1105,11 +1127,27 @@ impl AuthAgent {
         }
     }
 
+    /// Check a configuration completely before any of it is applied.
+    ///
+    /// [`AuthAgent::reconfigure`] applies settings one at a time, so a
+    /// refusal halfway would leave a mix of old and new; everything that can
+    /// be refused is refused here first.
+    fn preflight(&self, json_config: &AuthConfigJson) -> Result<()> {
+        refuse_unverified_modules(json_config)?;
+
+        let mut oidc_config = self.get_oidc_config().unwrap_or_default();
+        json_config.oidc.apply_to(&mut oidc_config);
+        oidc_config
+            .validate()
+            .map_err(|e| anyhow!("OIDC config validation failed: {}", e))?;
+
+        Ok(())
+    }
+
     /// Reconfigure the agent with new settings
     pub fn reconfigure(&self, json_config: AuthConfigJson) -> Result<()> {
-        // Checked before anything is written: the steps below are applied one
-        // by one, and a refusal halfway would leave a mix of old and new.
-        refuse_unverified_modules(&json_config)?;
+        // Checked before anything is written.
+        self.preflight(&json_config)?;
 
         let mut config = self
             .config
@@ -1194,6 +1232,11 @@ impl AuthAgent {
 
         drop(config);
 
+        // Update OIDC config (the JWKS is fetched in the background)
+        let mut oidc_config = self.get_oidc_config().unwrap_or_default();
+        json_config.oidc.apply_to(&mut oidc_config);
+        self.configure_oidc(oidc_config)?;
+
         // Update SAML config
         let mut saml_config = self.get_saml_config().unwrap_or_default();
         json_config.saml.apply_to(&mut saml_config);
@@ -1221,13 +1264,6 @@ impl AuthAgent {
 
         info!("Reconfigured auth agent");
         Ok(())
-    }
-
-    /// Reconfigure OIDC (async due to JWKS fetch).
-    pub async fn reconfigure_oidc(&self, json_config: &OidcConfigJson) -> Result<()> {
-        let mut oidc_config = self.get_oidc_config().unwrap_or_default();
-        json_config.apply_to(&mut oidc_config);
-        self.configure_oidc(oidc_config).await
     }
 
     /// Authenticate a request
@@ -1482,6 +1518,15 @@ impl AgentHandlerV2 for AuthAgent {
             "scim_requests_total",
             self.scim_requests_total.load(Ordering::Relaxed),
         ));
+        let jwks_fetches = self
+            .jwks_cache
+            .read()
+            .ok()
+            .and_then(|c| c.as_ref().map(|c| c.fetch_count()))
+            .unwrap_or(0);
+        report
+            .counters
+            .push(CounterMetric::new("oidc_jwks_fetches_total", jwks_fetches));
 
         Some(report)
     }
@@ -1496,18 +1541,14 @@ impl AgentHandlerV2 for AuthAgent {
             }
         };
 
-        // Before OIDC, so a refused configuration changes nothing at all.
-        if let Err(e) = refuse_unverified_modules(&json_config) {
+        // A refused configuration changes nothing at all.
+        if let Err(e) = self.preflight(&json_config) {
             error!("Configuration rejected: {}", e);
             return false;
         }
 
-        // Configure OIDC first (async due to JWKS fetch)
-        if let Err(e) = self.reconfigure_oidc(&json_config.oidc).await {
-            warn!("Failed to configure OIDC: {}", e);
-            // Don't fail entirely, OIDC is optional
-        }
-
+        // Applies everything, OIDC included. Nothing here waits for the
+        // network: the JWKS is fetched in the background.
         if let Err(e) = self.reconfigure(json_config) {
             warn!("Failed to reconfigure auth agent: {}", e);
             if let Ok(mut healthy) = self.is_healthy.write() {
@@ -2387,5 +2428,81 @@ mod tests {
         });
         assert!(agent.on_configure(config, None).await);
         assert_eq!(agent.config.read().unwrap().api_key_header, "X-Changed");
+    }
+
+    // OIDC: the token header does not choose the algorithm, unknown kids do
+    // not hammer the JWKS endpoint, and configuring never waits for it.
+
+    fn oidc_json(jwks_url: &str) -> serde_json::Value {
+        serde_json::json!({
+            "oidc": {
+                "enabled": true,
+                "issuer": oidc::test_support::TEST_ISSUER,
+                "jwks-url": jwks_url,
+                "jwks-fetch-timeout-ms": 300,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn configuring_oidc_does_not_wait_for_the_jwks_endpoint() {
+        let server = oidc::test_support::JwksServer::start_hanging().await;
+        let agent = AuthAgent::new(test_config(), None, None);
+        let started = std::time::Instant::now();
+        assert!(agent.on_configure(oidc_json(&server.url()), None).await);
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "on_configure waited {:?} for the JWKS endpoint",
+            started.elapsed()
+        );
+        // A token is rejected within the fetch timeout, not after 10 s.
+        let token = oidc::test_support::sign_rsa(
+            Algorithm::RS256,
+            Some(oidc::test_support::TEST_KID),
+            &oidc::test_support::test_claims("alice", serde_json::json!({})),
+        );
+        let started = std::time::Instant::now();
+        assert!(agent.authenticate_oidc(&token).await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn an_oidc_allowlist_naming_hs256_or_none_rejects_the_configuration() {
+        for alg in ["HS256", "none"] {
+            let agent = AuthAgent::new(test_config(), None, None);
+            let mut config = oidc_json("https://issuer.test/jwks.json");
+            config["oidc"]["allowed-algorithms"] = serde_json::json!(["RS256", alg]);
+            config["api-key-header"] = serde_json::json!("X-Changed");
+            assert!(!agent.on_configure(config, None).await, "{alg}");
+            assert_eq!(agent.config.read().unwrap().api_key_header, "X-API-Key");
+            assert!(!agent.get_oidc_config().unwrap().enabled);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_kid_flood_through_the_agent_fetches_once() {
+        use oidc::test_support::*;
+        let server = JwksServer::start().await;
+        let agent = AuthAgent::new(test_config(), None, None);
+        assert!(agent.on_configure(oidc_json(&server.url()), None).await);
+
+        let good = sign_rsa(
+            Algorithm::RS256,
+            Some(TEST_KID),
+            &test_claims("alice", serde_json::json!({})),
+        );
+        assert!(agent.authenticate_oidc(&good).await.is_ok());
+        let fetches = server.hits();
+        assert!(fetches >= 1);
+
+        for i in 0..300 {
+            let forged = sign_rsa(
+                Algorithm::RS256,
+                Some(&format!("unknown-{i}")),
+                &test_claims("mallory", serde_json::json!({})),
+            );
+            assert!(agent.authenticate_oidc(&forged).await.is_err());
+        }
+        assert_eq!(server.hits(), fetches, "unknown kids refetched the JWKS");
     }
 }

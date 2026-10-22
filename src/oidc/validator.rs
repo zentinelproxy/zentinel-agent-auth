@@ -5,10 +5,11 @@ use anyhow::{anyhow, Context, Result};
 use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::debug;
 
 use super::config::OidcConfig;
-use super::jwks::JwksCache;
+use super::jwks::{CachedKey, JwksCache};
 
 /// Standard OIDC/JWT claims.
 #[derive(Debug, Serialize, Deserialize)]
@@ -75,30 +76,57 @@ pub struct OidcIdentity {
 }
 
 /// Validate an OIDC/OAuth2 token.
+///
+/// The algorithm named in the token header is only a claim by the token, so
+/// it is checked before any key is used:
+///
+/// - it must be in `allowed-algorithms`, or, when that is empty, among the
+///   asymmetric algorithms the JWKS keys declare. `none` and `HS*` never
+///   qualify, so a public key is never used as an HMAC secret;
+/// - the key must accept it: a key that declares an `alg` verifies only that
+///   algorithm, and a key's type limits the rest (RSA: RS*/PS*, P-256:
+///   ES256, P-384: ES384).
 pub async fn validate_oidc_token(
     config: &OidcConfig,
-    jwks: &JwksCache,
+    jwks: &Arc<JwksCache>,
     token: &str,
 ) -> Result<OidcIdentity> {
-    // Decode header to get kid and algorithm
+    // Decode header to get kid and algorithm. A header naming `none` or an
+    // unknown algorithm fails to decode.
     let header = decode_header(token).context("Failed to decode token header")?;
+    let alg = header.alg;
 
     debug!(
         kid = ?header.kid,
-        alg = ?header.alg,
+        alg = ?alg,
         "Validating OIDC token"
     );
 
-    // Get the decoding key
-    let decoding_key = if let Some(ref kid) = header.kid {
-        jwks.get_key(kid).await?
+    let explicit = config
+        .explicit_allowed_algorithms()
+        .map_err(|e| anyhow!(e))?;
+    if let Some(ref allowed) = explicit {
+        if !allowed.contains(&alg) {
+            return Err(anyhow!("Token algorithm {:?} is not allowed", alg));
+        }
+    }
+
+    // Get the candidate keys
+    let keys: Vec<CachedKey> = if let Some(ref kid) = header.kid {
+        vec![jwks.get_key(kid).await?]
     } else {
-        // No kid specified, use default key
-        jwks.get_default_key().await?
+        jwks.candidate_keys(alg).await?
     };
 
+    if explicit.is_none() && !jwks.advertised_algorithms().contains(&alg) {
+        return Err(anyhow!(
+            "Token algorithm {:?} is not declared by any JWKS key",
+            alg
+        ));
+    }
+
     // Build validation
-    let mut validation = Validation::new(header.alg);
+    let mut validation = Validation::new(alg);
     validation.leeway = config.clock_skew_secs as u64;
 
     // Set issuer validation
@@ -114,9 +142,19 @@ pub async fn validate_oidc_token(
     // Validate required claims
     validation.set_required_spec_claims(&["exp", "iss"]);
 
-    // Decode and validate
-    let token_data = decode::<OidcClaims>(token, &decoding_key, &validation)
-        .context("Token validation failed")?;
+    // Decode and validate with the first key that accepts the algorithm
+    let mut last_error = anyhow!("No JWKS key accepts algorithm {:?}", alg);
+    let mut verified = None;
+    for key in keys.iter().filter(|k| k.accepts(alg)) {
+        match decode::<OidcClaims>(token, &key.key, &validation) {
+            Ok(data) => {
+                verified = Some(data);
+                break;
+            }
+            Err(e) => last_error = anyhow!(e).context("Token validation failed"),
+        }
+    }
+    let token_data = verified.ok_or(last_error)?;
 
     let claims = token_data.claims;
 
@@ -250,6 +288,119 @@ pub fn get_token_algorithm(token: &str) -> Result<Algorithm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oidc::jwks::JwksSettings;
+    use crate::oidc::test_support::*;
+    use std::time::Duration;
+
+    fn cache(server: &JwksServer) -> Arc<JwksCache> {
+        Arc::new(
+            JwksCache::new(
+                server.url(),
+                JwksSettings {
+                    refresh_interval: Duration::from_secs(3600),
+                    min_refetch_interval: Duration::from_secs(60),
+                    fetch_timeout: Duration::from_secs(2),
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_genuine_rs256_token_is_accepted() {
+        let server = JwksServer::start().await;
+        let jwks = cache(&server);
+        let config = test_oidc_config(&server.url());
+        let claims = test_claims("alice", serde_json::json!({}));
+
+        let with_kid = sign_rsa(Algorithm::RS256, Some(TEST_KID), &claims);
+        let identity = validate_oidc_token(&config, &jwks, &with_kid)
+            .await
+            .unwrap();
+        assert_eq!(identity.user_id, "alice");
+
+        let without_kid = sign_rsa(Algorithm::RS256, None, &claims);
+        assert!(validate_oidc_token(&config, &jwks, &without_kid)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn forged_algorithms_are_rejected() {
+        let server = JwksServer::start().await;
+        let jwks = cache(&server);
+        let config = test_oidc_config(&server.url());
+        let claims = test_claims("mallory", serde_json::json!({}));
+
+        let forgeries = [
+            // HMAC with the public key as the secret (algorithm confusion).
+            (
+                "hs256-public-key",
+                forge_hs256_with_public_key(Some(TEST_KID), &claims),
+            ),
+            (
+                "hs256-public-key-no-kid",
+                forge_hs256_with_public_key(None, &claims),
+            ),
+            // Unsigned.
+            ("none", unsigned_token(Some(TEST_KID), &claims)),
+            ("none-no-kid", unsigned_token(None, &claims)),
+            // Signed by the real key, but with an algorithm the key does not
+            // declare: the header must not choose the algorithm.
+            (
+                "rs512-for-rs256-key",
+                sign_rsa(Algorithm::RS512, Some(TEST_KID), &claims),
+            ),
+            (
+                "ps256-for-rs256-key",
+                sign_rsa(Algorithm::PS256, Some(TEST_KID), &claims),
+            ),
+            ("ps256-no-kid", sign_rsa(Algorithm::PS256, None, &claims)),
+        ];
+        for (name, token) in forgeries {
+            assert!(
+                validate_oidc_token(&config, &jwks, &token).await.is_err(),
+                "{name} was accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicit_allowlist_is_enforced() {
+        let server = JwksServer::start().await;
+        let jwks = cache(&server);
+        let claims = test_claims("alice", serde_json::json!({}));
+        let token = sign_rsa(Algorithm::RS256, Some(TEST_KID), &claims);
+
+        let mut config = test_oidc_config(&server.url());
+        config.allowed_algorithms = vec!["ES256".to_string()];
+        assert!(validate_oidc_token(&config, &jwks, &token).await.is_err());
+
+        config.allowed_algorithms = vec!["RS256".to_string()];
+        assert!(validate_oidc_token(&config, &jwks, &token).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_rsa_key_defaults_to_rs256_only() {
+        let body = serde_json::json!({
+            "keys": [{ "kty": "RSA", "kid": TEST_KID, "n": TEST_RSA_N.trim(), "e": "AQAB" }]
+        })
+        .to_string();
+        let server = JwksServer::start_with(body, false).await;
+        let jwks = cache(&server);
+        let mut config = test_oidc_config(&server.url());
+        let claims = test_claims("alice", serde_json::json!({}));
+
+        let rs256 = sign_rsa(Algorithm::RS256, Some(TEST_KID), &claims);
+        let ps256 = sign_rsa(Algorithm::PS256, Some(TEST_KID), &claims);
+        assert!(validate_oidc_token(&config, &jwks, &rs256).await.is_ok());
+        assert!(validate_oidc_token(&config, &jwks, &ps256).await.is_err());
+
+        // Opting in to PS256 explicitly works for a key that declares no alg.
+        config.allowed_algorithms = vec!["PS256".to_string()];
+        assert!(validate_oidc_token(&config, &jwks, &ps256).await.is_ok());
+        assert!(validate_oidc_token(&config, &jwks, &rs256).await.is_err());
+    }
 
     #[test]
     fn test_audience_contains() {

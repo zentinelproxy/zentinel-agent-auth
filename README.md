@@ -152,7 +152,10 @@ The code also contains these modules. Their settings are read only from
 `on_configure`, which Zentinel 0.6.50 does not send, so none of them can be
 turned on from a Zentinel config today. Treat them as experimental:
 
-- OIDC: bearer tokens checked against a JWKS fetched from a configured URL and refreshed periodically.
+- OIDC: bearer tokens checked against a JWKS fetched in the background from a
+  configured URL. The token's `alg` must be in `allowed-algorithms` (default:
+  what the JWKS keys declare; never `none` or `HS*`), and unknown `kid`s
+  refetch the JWKS at most once per `jwks-min-refetch-secs`.
 - Cedar authorization (partial): policies see the principal, the HTTP method
   as the action and the path as the resource, with no entity attributes or
   context, so policies on roles or claims do not match.
