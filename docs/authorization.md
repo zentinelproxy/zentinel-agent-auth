@@ -87,9 +87,15 @@ For simple configurations, embed the policy directly:
 | `enabled` | bool | `false` | Enable authorization |
 | `policy-file` | string | - | Path to Cedar policy file |
 | `policy-inline` | string | - | Inline Cedar policy |
-| `default-decision` | string | `deny` | Default when no policy matches |
-| `principal-claim` | string | `sub` | JWT claim for principal ID |
-| `roles-claim` | string | - | JWT claim containing roles |
+| `default-decision` | string | `deny` | Decision when no policy is satisfied. Never applies when a policy errors (that denies) |
+| `principal-claim` | string | `sub` | Claim used as the principal ID; the authenticated user ID when the claim is absent |
+| `roles-claim` | string | - | Claim containing roles: an array of strings, or one string separated by spaces or commas |
+| `log-decisions` | bool | `false` | Log each decision at debug level |
+
+The policies are compiled when the configuration arrives. A policy that does
+not parse, a missing policy file or an invalid `default-decision` rejects the
+whole configuration (`on_configure` returns false and nothing of it is
+applied), so authorization is never left switched off or half-configured.
 
 ## Cedar Basics
 
@@ -103,7 +109,7 @@ permit(
     action,              // What
     resource             // Which
 ) when {
-    // Conditions
+    true                 // Conditions
 };
 ```
 
@@ -111,28 +117,47 @@ permit(
 
 The agent creates these Cedar entities:
 
-| Entity Type | Source | Example |
-|-------------|--------|---------|
-| `User` | Authenticated user ID | `User::"john@example.com"` |
-| `Action` | HTTP method | `Action::"GET"` |
-| `Resource` | Request path | `Resource::"/api/users/123"` |
+| Entity Type | Source | Attributes | Example |
+|-------------|--------|------------|---------|
+| `User` | `principal-claim`, else the user ID | `id` | `User::"john@example.com"` |
+| `Action` | HTTP method (upper case) | - | `Action::"GET"` |
+| `Resource` | Request path, without the query string | `path` | `Resource::"/api/users/123"` |
 
 ### Context
 
 The context includes:
 
-```cedar
+```json
 {
-    "roles": ["admin", "user"],        // From roles claim
-    "claims": {                         // All JWT claims
+    "roles": ["admin", "user"],        // From roles-claim; [] without it
+    "claims": {                         // The verified token's claims
         "email": "john@example.com",
         "org_id": "acme"
     },
-    "auth_method": "jwt",              // How user authenticated
-    "path": "/api/users/123",          // Request path
-    "method": "GET"                    // HTTP method
+    "auth_method": "jwt",              // jwt, oidc, api_key, basic
+    "path": "/api/users/123",          // Request path, no query string
+    "method": "GET",                   // HTTP method
+    "hour": 14                         // Current hour, UTC (0-23)
 }
 ```
+
+`claims` holds the claims of the verified credential with their JSON types
+(strings, booleans, integers, arrays and objects). Nulls and non-integer
+numbers are left out, as are object keys starting with `__`, so a claim can
+never be read as a Cedar entity reference or extension value. API keys
+provide `api_key_name`, Basic auth provides `username`.
+
+Not every user has every claim. Guard optional claims with `has`
+(`context.claims has org_id && context.claims.org_id == "acme"`): see
+[Evaluation errors deny](#evaluation-errors-deny).
+
+### Evaluation errors deny
+
+Cedar skips a policy whose condition fails to evaluate, for example because
+it reads a claim the user does not have. A skipped `forbid` would let the
+request through, so the agent fails closed: if any policy errors, the request
+is denied with `403`, whatever `default-decision` says. A request the agent
+cannot express in Cedar is denied the same way.
 
 ## Example Policies
 
@@ -146,7 +171,7 @@ permit(principal, action, resource);
 ### Public Endpoints
 
 ```cedar
-// Allow unauthenticated access to health check
+// Allow any authenticated user to read the health check
 permit(
     principal,
     action == Action::"GET",
@@ -181,14 +206,15 @@ permit(
 ### Path-Based Access
 
 ```cedar
-// Allow access to user's own resources
+// Finance staff can use the reports API
 permit(
     principal,
     action,
     resource
 ) when {
-    resource.path like "/api/users/*" &&
-    resource.path.endsWith(principal.id)
+    resource.path like "/api/reports/*" &&
+    context.claims has department &&
+    context.claims.department == "finance"
 };
 ```
 
@@ -218,13 +244,14 @@ permit(
 ### Organization-Based Access
 
 ```cedar
-// Allow access only to own organization's resources
+// Allow only members of one organization
 permit(
     principal,
     action,
     resource
 ) when {
-    context.claims.org_id == resource.org_id
+    context.claims has org_id &&
+    context.claims.org_id == "acme"
 };
 ```
 
@@ -264,7 +291,7 @@ forbid(
 // Public Endpoints
 // ===================
 
-// Health check - no auth required
+// Health check - any authenticated user (authorization runs only after authentication)
 permit(
     principal,
     action == Action::"GET",
@@ -286,14 +313,14 @@ permit(
     resource.path like "/api/public/*"
 };
 
-// Users can access their own data
+// Users can access their own profile (Cedar cannot build strings,
+// so the path is matched against the principal's id directly)
 permit(
     principal,
     action,
     resource
 ) when {
-    resource.path like "/api/users/*" &&
-    context.claims.sub == resource.path.split("/").last()
+    context.path == "/api/me" && principal.id != ""
 };
 
 // Admins have full API access
@@ -334,16 +361,11 @@ forbid(
 };
 ```
 
-## Headers on Denial
+## Response on Denial
 
-When authorization fails:
-
-| Header | Description | Example |
-|--------|-------------|---------|
-| `X-Authz-Decision` | Decision result | `deny` |
-| `X-Authz-Reason` | Why denied | `No matching permit policy` |
-
-Response: `403 Forbidden`
+When authorization fails the agent answers `403 Forbidden` (body
+`Forbidden`) with the audit reason code `AUTHORIZATION_DENIED`. The reason
+and the deciding policies are logged at debug level.
 
 ## Debugging Policies
 
@@ -391,8 +413,9 @@ cedar authorize \
 ## Security Considerations
 
 1. **Default deny** - Always use `default-decision: deny`
-2. **Least privilege** - Grant minimum required access
-3. **Explicit forbids** - Use for critical resources
-4. **Review regularly** - Audit policies for over-permissive rules
-5. **Test thoroughly** - Verify policies before deployment
-6. **Secure policy files** - Restrict file permissions
+2. **Guard optional claims with `has`** - a policy that errors denies the request
+3. **Least privilege** - Grant minimum required access
+4. **Explicit forbids** - Use for critical resources
+5. **Review regularly** - Audit policies for over-permissive rules
+6. **Test thoroughly** - Verify policies before deployment
+7. **Secure policy files** - Restrict file permissions

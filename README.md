@@ -156,9 +156,11 @@ turned on from a Zentinel config today. Treat them as experimental:
   configured URL. The token's `alg` must be in `allowed-algorithms` (default:
   what the JWKS keys declare; never `none` or `HS*`), and unknown `kid`s
   refetch the JWKS at most once per `jwks-min-refetch-secs`.
-- Cedar authorization (partial): policies see the principal, the HTTP method
-  as the action and the path as the resource, with no entity attributes or
-  context, so policies on roles or claims do not match.
+- Cedar authorization: policies see the principal (with `id`), the HTTP
+  method as the action, the path as the resource (with `path`), and a context
+  with the verified claims, the roles claim, the auth method, method, path
+  and hour. A policy that does not parse rejects the configuration; a policy
+  that errors during evaluation denies the request.
 - SCIM 2.0 user store (redb) that can block deactivated OIDC users. Its
   endpoint takes the static bearer token (compared in constant time) or an
   OIDC token carrying `required-scope` (default `scim`; cannot be empty).

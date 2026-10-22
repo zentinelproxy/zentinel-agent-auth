@@ -36,7 +36,7 @@ use zentinel_agent_protocol::{
     ResponseHeadersEvent,
 };
 
-use authz::{AuthzConfig, AuthzConfigJson, CedarAuthorizer};
+use authz::{AuthzConfig, AuthzConfigJson, AuthzRequest, CedarAuthorizer};
 use exchange::{
     parse_exchange_request, SubjectTokenValidator, TokenExchangeConfig, TokenExchangeConfigJson,
     TokenIssuer, TokenType, ValidatedSubject,
@@ -144,7 +144,18 @@ impl std::fmt::Display for AuthMethod {
 pub struct Identity {
     pub id: String,
     pub method: AuthMethod,
+    /// Claims forwarded as `X-Auth-Claim-*` headers (string values only).
     pub claims: HashMap<String, serde_json::Value>,
+    /// The verified claims with their JSON types (arrays, numbers, ...) for
+    /// authorization, when they differ from `claims`.
+    pub raw_claims: Option<HashMap<String, serde_json::Value>>,
+}
+
+impl Identity {
+    /// Claims as authorization should see them.
+    pub fn authz_claims(&self) -> &HashMap<String, serde_json::Value> {
+        self.raw_claims.as_ref().unwrap_or(&self.claims)
+    }
 }
 
 /// JWT claims structure
@@ -559,15 +570,24 @@ impl AuthAgent {
     }
 
     /// Configure Cedar authorization.
+    ///
+    /// A policy that does not parse is an error and changes nothing; it
+    /// never leaves authorization switched off.
     pub fn configure_authz(&self, config: AuthzConfig) -> Result<()> {
-        if config.enabled {
-            let authorizer = CedarAuthorizer::new(&config)?;
+        let authorizer = if config.enabled {
+            let authorizer = CedarAuthorizer::new(&config)
+                .map_err(|e| anyhow!("Cedar authorization config rejected: {}", e))?;
+            info!("Cedar authorization configured");
+            Some(authorizer)
+        } else {
+            None
+        };
+        {
             let mut guard = self
                 .authorizer
                 .write()
                 .map_err(|_| anyhow!("Authorizer lock poisoned"))?;
-            *guard = Some(authorizer);
-            info!("Cedar authorization configured");
+            *guard = authorizer;
         }
 
         let mut authz_cfg = self
@@ -688,6 +708,7 @@ impl AuthAgent {
         Ok(Identity {
             id: identity.user_id,
             method: AuthMethod::Mtls,
+            raw_claims: None,
             claims,
         })
     }
@@ -730,6 +751,7 @@ impl AuthAgent {
             Identity {
                 id: identity.user_id,
                 method: AuthMethod::Oidc,
+                raw_claims: Some(identity.raw_claims),
                 claims,
             },
             identity.scopes,
@@ -954,24 +976,19 @@ impl AuthAgent {
             .read()
             .map_err(|_| anyhow!("Authorizer lock poisoned"))?;
 
+        // Enabled without a compiled policy set: fail closed.
         let authorizer = authorizer_guard
             .as_ref()
             .ok_or_else(|| anyhow!("Authorizer not initialized"))?;
 
-        // Build claims map for authorization context
-        let claims: HashMap<String, String> = identity
-            .claims
-            .iter()
-            .filter_map(|(k, v)| {
-                if let serde_json::Value::String(s) = v {
-                    Some((k.clone(), s.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let decision = authorizer.is_authorized(&identity.id, method, path, &claims);
+        let auth_method = identity.method.to_string();
+        let decision = authorizer.is_authorized(&AuthzRequest {
+            user_id: &identity.id,
+            auth_method: &auth_method,
+            method,
+            path,
+            claims: identity.authz_claims(),
+        });
 
         if !decision.allowed {
             debug!(
@@ -1047,6 +1064,7 @@ impl AuthAgent {
         Ok(Identity {
             id: session.user_id.clone(),
             method: AuthMethod::Saml,
+            raw_claims: None,
             claims,
         })
     }
@@ -1201,6 +1219,14 @@ impl AuthAgent {
         oidc_config
             .validate()
             .map_err(|e| anyhow!("OIDC config validation failed: {}", e))?;
+
+        let mut authz_config = self.get_authz_config().unwrap_or_default();
+        json_config.authz.apply_to(&mut authz_config);
+        if authz_config.enabled {
+            // Compiles the policies: a parse error rejects the configure.
+            CedarAuthorizer::new(&authz_config)
+                .map_err(|e| anyhow!("Cedar authorization config rejected: {}", e))?;
+        }
 
         let mut scim_config = self.get_scim_config().unwrap_or_default();
         json_config.scim.apply_to(&mut scim_config);
@@ -1426,6 +1452,7 @@ impl AuthAgent {
         Ok(Identity {
             id: user_id,
             method: AuthMethod::Jwt,
+            raw_claims: None,
             claims: claims_map,
         })
     }
@@ -1454,6 +1481,7 @@ impl AuthAgent {
         Ok(Identity {
             id: username.to_string(),
             method: AuthMethod::Basic,
+            raw_claims: None,
             claims: HashMap::from([(
                 "username".to_string(),
                 serde_json::Value::String(username.to_string()),
@@ -1471,6 +1499,7 @@ impl AuthAgent {
         Ok(Identity {
             id: key_info.name.clone(),
             method: AuthMethod::ApiKey,
+            raw_claims: None,
             claims: HashMap::from([(
                 "api_key_name".to_string(),
                 serde_json::Value::String(key_info.name.clone()),
@@ -2746,5 +2775,127 @@ mod tests {
         assert!(!agent.on_configure(config, None).await);
         assert!(!agent.get_scim_config().unwrap().enabled);
         assert!(!agent.get_oidc_config().unwrap().enabled, "partly applied");
+    }
+
+    // Cedar: policies see the verified claims, and a policy that does not
+    // parse rejects the configuration instead of switching authorization off.
+
+    fn jwt_for(claims: serde_json::Value) -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"test-secret-key-at-least-32-chars"),
+        )
+        .unwrap()
+    }
+
+    fn bearer(token: &str) -> HashMap<String, Vec<String>> {
+        HashMap::from([("authorization".to_string(), vec![format!("Bearer {token}")])])
+    }
+
+    const ROLE_POLICY: &str = r#"
+        permit(principal, action == Action::"GET", resource)
+        when { resource.path like "/api/*" && context.roles.contains("reader") };
+        permit(principal, action, resource)
+        when { context.claims has org && context.claims.org == "acme"
+               && context.roles.contains("admin") };
+    "#;
+
+    #[tokio::test]
+    async fn cedar_policies_match_on_jwt_claims_and_roles() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let config = serde_json::json!({
+            "authz": { "enabled": true, "policy-inline": ROLE_POLICY, "roles-claim": "roles" }
+        });
+        assert!(agent.on_configure(config, None).await);
+
+        let exp = chrono::Utc::now().timestamp() + 600;
+        let reader = jwt_for(serde_json::json!({ "sub": "r", "exp": exp, "roles": ["reader"] }));
+        let admin = jwt_for(
+            serde_json::json!({ "sub": "a", "exp": exp, "roles": ["admin"], "org": "acme" }),
+        );
+        let other_org = jwt_for(
+            serde_json::json!({ "sub": "o", "exp": exp, "roles": ["admin"], "org": "evil" }),
+        );
+
+        let cases = [
+            (&reader, "GET", "/api/items", None),
+            (&reader, "DELETE", "/api/items", Some(403)),
+            (&reader, "GET", "/admin", Some(403)),
+            (&admin, "DELETE", "/admin", None),
+            (&other_org, "DELETE", "/admin", Some(403)),
+        ];
+        for (token, method, path, expected) in cases {
+            let response = agent
+                .on_request_headers(request_event(method, path, bearer(token)))
+                .await;
+            assert_eq!(block_status(&response), expected, "{method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cedar_policies_match_on_oidc_array_claims() {
+        use oidc::test_support::*;
+        let server = JwksServer::start().await;
+        let agent = AuthAgent::new(test_config(), None, None);
+        let mut config = oidc_json(&server.url());
+        config["authz"] = serde_json::json!({
+            "enabled": true, "policy-inline": ROLE_POLICY, "roles-claim": "roles"
+        });
+        assert!(agent.on_configure(config, None).await);
+
+        let token = sign_rsa(
+            Algorithm::RS256,
+            Some(TEST_KID),
+            &test_claims("alice", serde_json::json!({ "roles": ["reader"] })),
+        );
+        let response = agent
+            .on_request_headers(request_event("GET", "/api/items", bearer(&token)))
+            .await;
+        assert_eq!(block_status(&response), None);
+        let response = agent
+            .on_request_headers(request_event("POST", "/api/items", bearer(&token)))
+            .await;
+        assert_eq!(block_status(&response), Some(403));
+    }
+
+    #[tokio::test]
+    async fn a_cedar_policy_that_does_not_parse_rejects_the_configuration() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let config = serde_json::json!({
+            "api-key-header": "X-Changed",
+            "authz": { "enabled": true, "policy-inline": "permit(principal, action" }
+        });
+        assert!(!agent.on_configure(config, None).await);
+        assert_eq!(agent.config.read().unwrap().api_key_header, "X-API-Key");
+
+        // A later configuration that keeps a broken policy stays rejected,
+        // and a working one already in place is kept.
+        let good = serde_json::json!({
+            "authz": { "enabled": true, "policy-inline": "forbid(principal, action, resource);" }
+        });
+        assert!(agent.on_configure(good, None).await);
+        let broken = serde_json::json!({
+            "authz": { "enabled": true, "policy-inline": "this is not cedar" }
+        });
+        assert!(!agent.on_configure(broken, None).await);
+        let mut headers = HashMap::new();
+        headers.insert("X-API-Key".to_string(), vec!["test-key-123".to_string()]);
+        let response = agent
+            .on_request_headers(request_event("GET", "/", headers))
+            .await;
+        assert_eq!(
+            block_status(&response),
+            Some(403),
+            "the old forbid-all must still apply"
+        );
+
+        // Calling configure_authz directly with a broken policy is an error.
+        let broken = AuthzConfig {
+            enabled: true,
+            policy_inline: Some("nope".to_string()),
+            ..AuthzConfig::default()
+        };
+        assert!(agent.configure_authz(broken).is_err());
     }
 }

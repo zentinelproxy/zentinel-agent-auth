@@ -73,6 +73,8 @@ pub struct OidcIdentity {
     pub scopes: Vec<String>,
     /// All claims as key-value pairs
     pub claims: HashMap<String, String>,
+    /// All claims with their JSON types, for authorization.
+    pub raw_claims: HashMap<String, serde_json::Value>,
 }
 
 /// Validate an OIDC/OAuth2 token.
@@ -178,6 +180,12 @@ pub async fn validate_oidc_token(
 
     // Build claims map for headers
     let claims_map = build_claims_map(&claims);
+    let raw_claims: HashMap<String, serde_json::Value> = match serde_json::to_value(&claims) {
+        Ok(serde_json::Value::Object(map)) => {
+            map.into_iter().filter(|(_, v)| !v.is_null()).collect()
+        }
+        _ => HashMap::new(),
+    };
 
     debug!(
         user_id = %user_id,
@@ -189,6 +197,7 @@ pub async fn validate_oidc_token(
         user_id,
         scopes,
         claims: claims_map,
+        raw_claims,
     })
 }
 

@@ -5,5 +5,5 @@
 pub mod cedar;
 pub mod config;
 
-pub use cedar::CedarAuthorizer;
+pub use cedar::{AuthzRequest, CedarAuthorizer};
 pub use config::{AuthzConfig, AuthzConfigJson};
