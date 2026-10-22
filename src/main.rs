@@ -5,11 +5,13 @@
 //! OIDC/OAuth 2.0, mTLS client certificates, and Cedar policy authorization.
 
 mod authz;
+mod credentials;
 mod exchange;
 mod mtls;
 mod oidc;
 mod saml;
 mod scim;
+mod secret;
 mod session;
 
 use anyhow::{anyhow, Context, Result};
@@ -20,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,13 +37,17 @@ use zentinel_agent_protocol::{
     ResponseHeadersEvent,
 };
 
-use authz::{AuthzConfig, AuthzConfigJson, CedarAuthorizer};
+use authz::{AuthzConfig, AuthzConfigJson, AuthzRequest, CedarAuthorizer};
+use credentials::{
+    dummy_bcrypt_check, find_api_key, parse_api_keys, parse_basic_auth_users, ApiKeyInfo,
+    BasicAuthUser, PasswordCheck,
+};
 use exchange::{
     parse_exchange_request, SubjectTokenValidator, TokenExchangeConfig, TokenExchangeConfigJson,
     TokenIssuer, TokenType, ValidatedSubject,
 };
 use mtls::{validate_client_cert, MtlsConfig, MtlsConfigJson};
-use oidc::{validate_oidc_token, JwksCache, OidcConfig, OidcConfigJson};
+use oidc::{validate_oidc_token, JwksCache, JwksSettings, OidcConfig, OidcConfigJson};
 use saml::{SamlConfig, SamlConfigJson, SamlProvider};
 use scim::{
     handle_scim_body, handle_scim_delete, handle_scim_get, match_scim_route, scim_error_response,
@@ -90,9 +97,13 @@ struct Args {
     #[arg(long, default_value = "X-API-Key", env = "API_KEY_HEADER")]
     api_key_header: String,
 
-    /// Basic auth users (comma-separated user:pass pairs)
+    /// Basic auth users (comma-separated user:bcrypt-hash pairs)
     #[arg(long, env = "BASIC_AUTH_USERS")]
     basic_auth_users: Option<String>,
+
+    /// Accept plain-text Basic auth passwords (not recommended)
+    #[arg(long, env = "BASIC_AUTH_ALLOW_PLAINTEXT")]
+    basic_auth_allow_plaintext: bool,
 
     /// Header to add with user ID
     #[arg(long, default_value = "X-User-Id", env = "USER_ID_HEADER")]
@@ -142,7 +153,18 @@ impl std::fmt::Display for AuthMethod {
 pub struct Identity {
     pub id: String,
     pub method: AuthMethod,
+    /// Claims forwarded as `X-Auth-Claim-*` headers (string values only).
     pub claims: HashMap<String, serde_json::Value>,
+    /// The verified claims with their JSON types (arrays, numbers, ...) for
+    /// authorization, when they differ from `claims`.
+    pub raw_claims: Option<HashMap<String, serde_json::Value>>,
+}
+
+impl Identity {
+    /// Claims as authorization should see them.
+    pub fn authz_claims(&self) -> &HashMap<String, serde_json::Value> {
+        self.raw_claims.as_ref().unwrap_or(&self.claims)
+    }
 }
 
 /// JWT claims structure
@@ -158,20 +180,6 @@ pub struct JwtClaims {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
-/// API key info
-#[derive(Debug, Clone)]
-pub struct ApiKeyInfo {
-    pub key: String,
-    pub name: String,
-}
-
-/// Basic auth user
-#[derive(Debug, Clone)]
-pub struct BasicAuthUser {
-    pub username: String,
-    pub password_hash: String,
-}
-
 /// Authentication agent configuration
 pub struct AuthConfig {
     pub jwt_secret: Option<Vec<u8>>,
@@ -179,7 +187,7 @@ pub struct AuthConfig {
     pub jwt_algorithm: Algorithm,
     pub jwt_issuer: Option<String>,
     pub jwt_audience: Option<String>,
-    pub api_keys: HashMap<String, ApiKeyInfo>,
+    pub api_keys: Vec<ApiKeyInfo>,
     pub api_key_header: String,
     pub basic_auth_users: HashMap<String, BasicAuthUser>,
     pub user_id_header: String,
@@ -204,9 +212,12 @@ pub struct AuthConfigJson {
     pub api_keys: Vec<String>,
     /// API key header name
     pub api_key_header: Option<String>,
-    /// Basic auth users as user:pass pairs
+    /// Basic auth users as user:bcrypt-hash pairs
     #[serde(default)]
     pub basic_auth_users: Vec<String>,
+    /// Accept plain-text passwords in `basic-auth-users`
+    #[serde(default)]
+    pub basic_auth_allow_plaintext: bool,
     /// Header to add with user ID
     pub user_id_header: Option<String>,
     /// Header to add with auth method
@@ -318,38 +329,19 @@ impl AuthConfig {
         };
 
         // Parse API keys
-        let mut api_keys = HashMap::new();
-        if let Some(keys_str) = &args.api_keys {
-            for pair in keys_str.split(',') {
-                let pair = pair.trim();
-                if let Some((key, name)) = pair.split_once(':') {
-                    api_keys.insert(
-                        key.trim().to_string(),
-                        ApiKeyInfo {
-                            key: key.trim().to_string(),
-                            name: name.trim().to_string(),
-                        },
-                    );
-                }
-            }
-        }
+        let api_keys = args
+            .api_keys
+            .as_deref()
+            .map(|keys| parse_api_keys(keys.split(',')))
+            .unwrap_or_default();
 
         // Parse basic auth users
-        let mut basic_auth_users = HashMap::new();
-        if let Some(users_str) = &args.basic_auth_users {
-            for pair in users_str.split(',') {
-                let pair = pair.trim();
-                if let Some((user, pass)) = pair.split_once(':') {
-                    basic_auth_users.insert(
-                        user.trim().to_string(),
-                        BasicAuthUser {
-                            username: user.trim().to_string(),
-                            password_hash: pass.trim().to_string(),
-                        },
-                    );
-                }
+        let basic_auth_users = match &args.basic_auth_users {
+            Some(users) => {
+                parse_basic_auth_users(users.split(','), args.basic_auth_allow_plaintext)?
             }
-        }
+            None => HashMap::new(),
+        };
 
         Ok(Self {
             jwt_secret,
@@ -365,6 +357,14 @@ impl AuthConfig {
             fail_open: args.fail_open,
         })
     }
+}
+
+/// Outcome of authenticating a SCIM request.
+#[derive(Debug, PartialEq, Eq)]
+enum ScimAuth {
+    Allowed,
+    Unauthenticated,
+    MissingScope,
 }
 
 /// Authentication agent
@@ -472,15 +472,36 @@ impl AuthAgent {
     }
 
     /// Configure OIDC provider.
-    pub async fn configure_oidc(&self, config: OidcConfig) -> Result<()> {
-        if config.enabled {
-            let cache = JwksCache::new(config.jwks_url.clone(), config.jwks_refresh_secs).await?;
+    ///
+    /// Never waits for the JWKS endpoint: the keys are fetched in a
+    /// background task with a bounded timeout, and tokens are rejected until
+    /// they have loaded.
+    pub fn configure_oidc(&self, config: OidcConfig) -> Result<()> {
+        config
+            .validate()
+            .map_err(|e| anyhow!("OIDC config validation failed: {}", e))?;
+
+        let cache = if config.enabled {
+            let cache = Arc::new(JwksCache::new(
+                config.jwks_url.clone(),
+                JwksSettings {
+                    refresh_interval: Duration::from_secs(config.jwks_refresh_secs),
+                    min_refetch_interval: Duration::from_secs(config.jwks_min_refetch_secs),
+                    fetch_timeout: Duration::from_millis(config.jwks_fetch_timeout_ms),
+                },
+            )?);
+            cache.spawn_refresh();
+            info!(issuer = %config.issuer, "OIDC configured");
+            Some(cache)
+        } else {
+            None
+        };
+        {
             let mut guard = self
                 .jwks_cache
                 .write()
                 .map_err(|_| anyhow!("JWKS cache lock poisoned"))?;
-            *guard = Some(Arc::new(cache));
-            info!(issuer = %config.issuer, "OIDC configured");
+            *guard = cache;
         }
 
         let mut oidc_cfg = self
@@ -528,15 +549,24 @@ impl AuthAgent {
     }
 
     /// Configure Cedar authorization.
+    ///
+    /// A policy that does not parse is an error and changes nothing; it
+    /// never leaves authorization switched off.
     pub fn configure_authz(&self, config: AuthzConfig) -> Result<()> {
-        if config.enabled {
-            let authorizer = CedarAuthorizer::new(&config)?;
+        let authorizer = if config.enabled {
+            let authorizer = CedarAuthorizer::new(&config)
+                .map_err(|e| anyhow!("Cedar authorization config rejected: {}", e))?;
+            info!("Cedar authorization configured");
+            Some(authorizer)
+        } else {
+            None
+        };
+        {
             let mut guard = self
                 .authorizer
                 .write()
                 .map_err(|_| anyhow!("Authorizer lock poisoned"))?;
-            *guard = Some(authorizer);
-            info!("Cedar authorization configured");
+            *guard = authorizer;
         }
 
         let mut authz_cfg = self
@@ -624,7 +654,7 @@ impl AuthAgent {
 
         let scim_config = self.get_scim_config()?;
         if let Some(ref expected) = scim_config.bearer_token {
-            if token == expected {
+            if secret::secrets_equal(token.as_bytes(), expected.as_bytes()) {
                 return Ok(());
             }
         }
@@ -657,12 +687,20 @@ impl AuthAgent {
         Ok(Identity {
             id: identity.user_id,
             method: AuthMethod::Mtls,
+            raw_claims: None,
             claims,
         })
     }
 
     /// Try to authenticate via OIDC token.
     async fn authenticate_oidc(&self, token: &str) -> Result<Identity> {
+        self.authenticate_oidc_with_scopes(token)
+            .await
+            .map(|(identity, _)| identity)
+    }
+
+    /// Authenticate via OIDC token, also returning the token's scopes.
+    async fn authenticate_oidc_with_scopes(&self, token: &str) -> Result<(Identity, Vec<String>)> {
         let oidc_config = self.get_oidc_config()?;
 
         if !oidc_config.enabled {
@@ -681,18 +719,64 @@ impl AuthAgent {
                 .clone()
         };
 
-        let identity = validate_oidc_token(&oidc_config, jwks.as_ref(), token).await?;
+        let identity = validate_oidc_token(&oidc_config, &jwks, token).await?;
 
         let mut claims = HashMap::new();
         for (k, v) in identity.claims {
             claims.insert(k, serde_json::Value::String(v));
         }
 
-        Ok(Identity {
-            id: identity.user_id,
-            method: AuthMethod::Oidc,
-            claims,
-        })
+        Ok((
+            Identity {
+                id: identity.user_id,
+                method: AuthMethod::Oidc,
+                raw_claims: Some(identity.raw_claims),
+                claims,
+            },
+            identity.scopes,
+        ))
+    }
+
+    /// Authenticate a request to the SCIM endpoint: the static bearer token,
+    /// or (with `use-oidc-auth`) an OIDC token carrying the SCIM scope.
+    async fn authorize_scim(
+        &self,
+        scim_config: &ScimConfig,
+        auth_header: Option<&str>,
+    ) -> ScimAuth {
+        let Some(header) = auth_header else {
+            return ScimAuth::Unauthenticated;
+        };
+        if self.validate_scim_bearer_token(header).is_ok() {
+            return ScimAuth::Allowed;
+        }
+        if !scim_config.use_oidc_auth {
+            return ScimAuth::Unauthenticated;
+        }
+        let Some(token) = header
+            .strip_prefix("Bearer ")
+            .or_else(|| header.strip_prefix("bearer "))
+        else {
+            return ScimAuth::Unauthenticated;
+        };
+        let (identity, scopes) = match self.authenticate_oidc_with_scopes(token).await {
+            Ok(v) => v,
+            Err(_) => return ScimAuth::Unauthenticated,
+        };
+        // Refused by validate(), but never treat a missing scope as "any".
+        let Some(required) = scim_config.oidc_scope() else {
+            return ScimAuth::MissingScope;
+        };
+        if scopes.iter().any(|s| s == required) {
+            ScimAuth::Allowed
+        } else {
+            warn!(
+                user = %identity.id,
+                required_scope = %required,
+                "SCIM request refused: OIDC token lacks the SCIM scope"
+            );
+            ScimAuth::MissingScope
+        }
     }
 
     /// Handle token exchange request body.
@@ -871,24 +955,19 @@ impl AuthAgent {
             .read()
             .map_err(|_| anyhow!("Authorizer lock poisoned"))?;
 
+        // Enabled without a compiled policy set: fail closed.
         let authorizer = authorizer_guard
             .as_ref()
             .ok_or_else(|| anyhow!("Authorizer not initialized"))?;
 
-        // Build claims map for authorization context
-        let claims: HashMap<String, String> = identity
-            .claims
-            .iter()
-            .filter_map(|(k, v)| {
-                if let serde_json::Value::String(s) = v {
-                    Some((k.clone(), s.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let decision = authorizer.is_authorized(&identity.id, method, path, &claims);
+        let auth_method = identity.method.to_string();
+        let decision = authorizer.is_authorized(&AuthzRequest {
+            user_id: &identity.id,
+            auth_method: &auth_method,
+            method,
+            path,
+            claims: identity.authz_claims(),
+        });
 
         if !decision.allowed {
             debug!(
@@ -964,6 +1043,7 @@ impl AuthAgent {
         Ok(Identity {
             id: session.user_id.clone(),
             method: AuthMethod::Saml,
+            raw_claims: None,
             claims,
         })
     }
@@ -1003,8 +1083,9 @@ impl AuthAgent {
         saml_config: &SamlConfig,
         user_id_header: &str,
         auth_method_header: &str,
+        strip: &[String],
     ) -> AgentResponse {
-        let mut response = AgentResponse::default_allow()
+        let mut response = allow_without_identity(strip)
             .add_request_header(HeaderOp::Set {
                 name: user_id_header.to_string(),
                 value: identity.id.clone(),
@@ -1028,7 +1109,7 @@ impl AuthAgent {
         for (key, value) in &identity.claims {
             if let serde_json::Value::String(s) = value {
                 response = response.add_request_header(HeaderOp::Set {
-                    name: format!("X-Auth-Claim-{}", key),
+                    name: format!("{CLAIM_HEADER_PREFIX}{key}"),
                     value: s.clone(),
                 });
             }
@@ -1048,12 +1129,14 @@ impl AuthAgent {
         auth_method_header: &str,
         request_method: &str,
         request_path: &str,
+        strip: &[String],
     ) -> AgentResponse {
         // Check authorization
         match self.check_authorization(&identity, request_method, request_path) {
             Ok(true) => {
-                // Authorized - build success response
-                let mut response = AgentResponse::default_allow()
+                // Authorized - build success response. Client-supplied
+                // identity headers are removed before ours are set.
+                let mut response = allow_without_identity(strip)
                     .add_request_header(HeaderOp::Set {
                         name: user_id_header.to_string(),
                         value: identity.id.clone(),
@@ -1067,7 +1150,7 @@ impl AuthAgent {
                 for (key, value) in &identity.claims {
                     if let serde_json::Value::String(s) = value {
                         response = response.add_request_header(HeaderOp::Set {
-                            name: format!("X-Auth-Claim-{}", key),
+                            name: format!("{CLAIM_HEADER_PREFIX}{key}"),
                             value: s.clone(),
                         });
                     }
@@ -1105,11 +1188,60 @@ impl AuthAgent {
         }
     }
 
+    /// Check a configuration completely before any of it is applied.
+    ///
+    /// [`AuthAgent::reconfigure`] applies settings one at a time, so a
+    /// refusal halfway would leave a mix of old and new; everything that can
+    /// be refused is refused here first.
+    fn preflight(&self, json_config: &AuthConfigJson) -> Result<()> {
+        refuse_unverified_modules(json_config)?;
+
+        let mut oidc_config = self.get_oidc_config().unwrap_or_default();
+        json_config.oidc.apply_to(&mut oidc_config);
+        oidc_config
+            .validate()
+            .map_err(|e| anyhow!("OIDC config validation failed: {}", e))?;
+
+        Self::parse_json_basic_auth_users(json_config)?;
+
+        let mut authz_config = self.get_authz_config().unwrap_or_default();
+        json_config.authz.apply_to(&mut authz_config);
+        if authz_config.enabled {
+            // Compiles the policies: a parse error rejects the configure.
+            CedarAuthorizer::new(&authz_config)
+                .map_err(|e| anyhow!("Cedar authorization config rejected: {}", e))?;
+        }
+
+        let mut scim_config = self.get_scim_config().unwrap_or_default();
+        json_config.scim.apply_to(&mut scim_config);
+        if scim_config.enabled {
+            scim_config
+                .validate()
+                .map_err(|e| anyhow!("SCIM config validation failed: {}", e))?;
+        }
+
+        Ok(())
+    }
+
+    /// The Basic auth users of a configuration, if it sets any.
+    fn parse_json_basic_auth_users(
+        json_config: &AuthConfigJson,
+    ) -> Result<Option<HashMap<String, BasicAuthUser>>> {
+        if json_config.basic_auth_users.is_empty() {
+            return Ok(None);
+        }
+        parse_basic_auth_users(
+            json_config.basic_auth_users.iter().map(String::as_str),
+            json_config.basic_auth_allow_plaintext,
+        )
+        .map(Some)
+    }
+
     /// Reconfigure the agent with new settings
     pub fn reconfigure(&self, json_config: AuthConfigJson) -> Result<()> {
-        // Checked before anything is written: the steps below are applied one
-        // by one, and a refusal halfway would leave a mix of old and new.
-        refuse_unverified_modules(&json_config)?;
+        // Checked before anything is written.
+        self.preflight(&json_config)?;
+        let basic_auth_users = Self::parse_json_basic_auth_users(&json_config)?;
 
         let mut config = self
             .config
@@ -1146,18 +1278,7 @@ impl AuthAgent {
 
         // Update API keys
         if !json_config.api_keys.is_empty() {
-            config.api_keys.clear();
-            for pair in json_config.api_keys {
-                if let Some((key, name)) = pair.split_once(':') {
-                    config.api_keys.insert(
-                        key.trim().to_string(),
-                        ApiKeyInfo {
-                            key: key.trim().to_string(),
-                            name: name.trim().to_string(),
-                        },
-                    );
-                }
-            }
+            config.api_keys = parse_api_keys(json_config.api_keys.iter().map(String::as_str));
         }
 
         // Update API key header
@@ -1165,20 +1286,9 @@ impl AuthAgent {
             config.api_key_header = header;
         }
 
-        // Update basic auth users
-        if !json_config.basic_auth_users.is_empty() {
-            config.basic_auth_users.clear();
-            for pair in json_config.basic_auth_users {
-                if let Some((user, pass)) = pair.split_once(':') {
-                    config.basic_auth_users.insert(
-                        user.trim().to_string(),
-                        BasicAuthUser {
-                            username: user.trim().to_string(),
-                            password_hash: pass.trim().to_string(),
-                        },
-                    );
-                }
-            }
+        // Update basic auth users (parsed before the lock was taken)
+        if let Some(users) = basic_auth_users {
+            config.basic_auth_users = users;
         }
 
         // Update headers
@@ -1193,6 +1303,11 @@ impl AuthAgent {
         config.fail_open = json_config.fail_open;
 
         drop(config);
+
+        // Update OIDC config (the JWKS is fetched in the background)
+        let mut oidc_config = self.get_oidc_config().unwrap_or_default();
+        json_config.oidc.apply_to(&mut oidc_config);
+        self.configure_oidc(oidc_config)?;
 
         // Update SAML config
         let mut saml_config = self.get_saml_config().unwrap_or_default();
@@ -1223,19 +1338,8 @@ impl AuthAgent {
         Ok(())
     }
 
-    /// Reconfigure OIDC (async due to JWKS fetch).
-    pub async fn reconfigure_oidc(&self, json_config: &OidcConfigJson) -> Result<()> {
-        let mut oidc_config = self.get_oidc_config().unwrap_or_default();
-        json_config.apply_to(&mut oidc_config);
-        self.configure_oidc(oidc_config).await
-    }
-
     /// Authenticate a request
-    pub fn authenticate(&self, headers: &HashMap<String, Vec<String>>) -> Result<Identity> {
-        let config = self
-            .config
-            .read()
-            .map_err(|_| anyhow!("Failed to acquire read lock"))?;
+    pub async fn authenticate(&self, headers: &HashMap<String, Vec<String>>) -> Result<Identity> {
         // Helper to get first header value (case-insensitive)
         let get_header = |name: &str| -> Option<&str> {
             let name_lower = name.to_lowercase();
@@ -1247,25 +1351,50 @@ impl AuthAgent {
             None
         };
 
-        // 1. Try JWT Bearer token
-        if let Some(auth_header) = get_header("authorization") {
-            if auth_header.starts_with("Bearer ") || auth_header.starts_with("bearer ") {
-                let token = &auth_header[7..];
-                if let Ok(identity) = Self::validate_jwt(&config, token) {
-                    return Ok(identity);
+        let pending_bcrypt = {
+            let config = self
+                .config
+                .read()
+                .map_err(|_| anyhow!("Failed to acquire read lock"))?;
+            let mut pending = None;
+
+            if let Some(auth_header) = get_header("authorization") {
+                // 1. Try JWT Bearer token
+                if auth_header.starts_with("Bearer ") || auth_header.starts_with("bearer ") {
+                    let token = &auth_header[7..];
+                    if let Ok(identity) = Self::validate_jwt(&config, token) {
+                        return Ok(identity);
+                    }
+                }
+
+                // 2. Try Basic auth
+                if auth_header.starts_with("Basic ") || auth_header.starts_with("basic ") {
+                    match Self::check_basic_auth(&config, &auth_header[6..]) {
+                        BasicCheck::Valid(username) => return Ok(basic_identity(&username)),
+                        BasicCheck::Invalid => {}
+                        BasicCheck::NeedsBcrypt(job) => pending = Some(job),
+                    }
                 }
             }
+            pending
+        };
 
-            // 2. Try Basic auth
-            if auth_header.starts_with("Basic ") || auth_header.starts_with("basic ") {
-                let credentials = &auth_header[6..];
-                if let Ok(identity) = Self::validate_basic_auth(&config, credentials) {
-                    return Ok(identity);
-                }
+        // bcrypt takes 100+ ms: run it off the async worker threads.
+        if let Some(job) = pending_bcrypt {
+            let username = job.username.clone();
+            let valid = tokio::task::spawn_blocking(move || job.run())
+                .await
+                .unwrap_or(false);
+            if valid {
+                return Ok(basic_identity(&username));
             }
         }
 
         // 3. Try API key
+        let config = self
+            .config
+            .read()
+            .map_err(|_| anyhow!("Failed to acquire read lock"))?;
         if let Some(api_key) = get_header(&config.api_key_header) {
             if let Ok(identity) = Self::validate_api_key(&config, api_key) {
                 return Ok(identity);
@@ -1321,56 +1450,103 @@ impl AuthAgent {
         Ok(Identity {
             id: user_id,
             method: AuthMethod::Jwt,
+            raw_claims: None,
             claims: claims_map,
         })
     }
 
-    /// Validate Basic auth credentials
-    fn validate_basic_auth(config: &AuthConfig, credentials: &str) -> Result<Identity> {
-        let decoded = BASE64
-            .decode(credentials)
-            .context("Invalid base64 in Basic auth")?;
-        let auth_str = String::from_utf8(decoded).context("Invalid UTF-8 in Basic auth")?;
+    /// Check Basic auth credentials as far as possible without bcrypt.
+    fn check_basic_auth(config: &AuthConfig, credentials: &str) -> BasicCheck {
+        let Ok(decoded) = BASE64.decode(credentials.trim()) else {
+            return BasicCheck::Invalid;
+        };
+        let Ok(auth_str) = String::from_utf8(decoded) else {
+            return BasicCheck::Invalid;
+        };
+        let Some((username, password)) = auth_str.split_once(':') else {
+            return BasicCheck::Invalid;
+        };
 
-        let (username, password) = auth_str
-            .split_once(':')
-            .ok_or_else(|| anyhow!("Invalid Basic auth format"))?;
-
-        let user = config
-            .basic_auth_users
-            .get(username)
-            .ok_or_else(|| anyhow!("User not found"))?;
-
-        // Simple password check (in production, use bcrypt or similar)
-        if password != user.password_hash {
-            return Err(anyhow!("Invalid password"));
+        match config.basic_auth_users.get(username) {
+            Some(user) => match user.quick_check(password) {
+                Some(true) => BasicCheck::Valid(username.to_string()),
+                Some(false) => BasicCheck::Invalid,
+                None => BasicCheck::NeedsBcrypt(BcryptJob {
+                    username: username.to_string(),
+                    password: password.to_string(),
+                    user: Some(user.clone()),
+                }),
+            },
+            // An unknown user costs a bcrypt run too when bcrypt users
+            // exist, so timing does not reveal which users exist.
+            None if config
+                .basic_auth_users
+                .values()
+                .any(|u| matches!(u.password, PasswordCheck::Bcrypt(_))) =>
+            {
+                BasicCheck::NeedsBcrypt(BcryptJob {
+                    username: username.to_string(),
+                    password: password.to_string(),
+                    user: None,
+                })
+            }
+            None => BasicCheck::Invalid,
         }
-
-        Ok(Identity {
-            id: username.to_string(),
-            method: AuthMethod::Basic,
-            claims: HashMap::from([(
-                "username".to_string(),
-                serde_json::Value::String(username.to_string()),
-            )]),
-        })
     }
 
     /// Validate API key
     fn validate_api_key(config: &AuthConfig, api_key: &str) -> Result<Identity> {
-        let key_info = config
-            .api_keys
-            .get(api_key)
-            .ok_or_else(|| anyhow!("Invalid API key"))?;
+        let key_info =
+            find_api_key(&config.api_keys, api_key).ok_or_else(|| anyhow!("Invalid API key"))?;
 
         Ok(Identity {
             id: key_info.name.clone(),
             method: AuthMethod::ApiKey,
+            raw_claims: None,
             claims: HashMap::from([(
                 "api_key_name".to_string(),
                 serde_json::Value::String(key_info.name.clone()),
             )]),
         })
+    }
+}
+
+/// Outcome of checking Basic credentials without bcrypt.
+enum BasicCheck {
+    Valid(String),
+    Invalid,
+    NeedsBcrypt(BcryptJob),
+}
+
+/// A bcrypt verification to run on a blocking thread.
+struct BcryptJob {
+    username: String,
+    password: String,
+    /// `None` for an unknown user: checked against a dummy hash.
+    user: Option<BasicAuthUser>,
+}
+
+impl BcryptJob {
+    fn run(self) -> bool {
+        match self.user {
+            Some(user) => user.bcrypt_check(&self.password),
+            None => {
+                dummy_bcrypt_check(&self.password);
+                false
+            }
+        }
+    }
+}
+
+fn basic_identity(username: &str) -> Identity {
+    Identity {
+        id: username.to_string(),
+        method: AuthMethod::Basic,
+        raw_claims: None,
+        claims: HashMap::from([(
+            "username".to_string(),
+            serde_json::Value::String(username.to_string()),
+        )]),
     }
 }
 
@@ -1482,6 +1658,15 @@ impl AgentHandlerV2 for AuthAgent {
             "scim_requests_total",
             self.scim_requests_total.load(Ordering::Relaxed),
         ));
+        let jwks_fetches = self
+            .jwks_cache
+            .read()
+            .ok()
+            .and_then(|c| c.as_ref().map(|c| c.fetch_count()))
+            .unwrap_or(0);
+        report
+            .counters
+            .push(CounterMetric::new("oidc_jwks_fetches_total", jwks_fetches));
 
         Some(report)
     }
@@ -1496,18 +1681,14 @@ impl AgentHandlerV2 for AuthAgent {
             }
         };
 
-        // Before OIDC, so a refused configuration changes nothing at all.
-        if let Err(e) = refuse_unverified_modules(&json_config) {
+        // A refused configuration changes nothing at all.
+        if let Err(e) = self.preflight(&json_config) {
             error!("Configuration rejected: {}", e);
             return false;
         }
 
-        // Configure OIDC first (async due to JWKS fetch)
-        if let Err(e) = self.reconfigure_oidc(&json_config.oidc).await {
-            warn!("Failed to configure OIDC: {}", e);
-            // Don't fail entirely, OIDC is optional
-        }
-
+        // Applies everything, OIDC included. Nothing here waits for the
+        // network: the JWKS is fetched in the background.
         if let Err(e) = self.reconfigure(json_config) {
             warn!("Failed to reconfigure auth agent: {}", e);
             if let Ok(mut healthy) = self.is_healthy.write() {
@@ -1569,22 +1750,18 @@ impl AgentHandlerV2 for AuthAgent {
         // Get SAML config
         let saml_config = self.get_saml_config().unwrap_or_default();
 
-        // Get request path and method for matching
-        let request_path = event
-            .headers
-            .get("path")
-            .or_else(|| event.headers.get(":path"))
-            .and_then(|v| v.first())
-            .map(|s| s.as_str())
-            .unwrap_or("/");
+        // Identity headers to remove from every request let through.
+        let strip = identity_header_names(
+            &[&user_id_header, &auth_method_header],
+            saml_config.attribute_mapping.values(),
+            &event.headers,
+        );
 
-        let request_method = event
-            .headers
-            .get("method")
-            .or_else(|| event.headers.get(":method"))
-            .and_then(|v| v.first())
-            .map(|s| s.to_uppercase())
-            .unwrap_or_default();
+        // Get request path and method for matching. Zentinel moves the
+        // `:path` and `:method` pseudo-headers into `uri` and `method` and
+        // removes them from `headers`.
+        let (request_path, request_method) = request_target(&event);
+        let request_path = request_path.as_str();
 
         // Check if this is a SCIM provisioning endpoint
         let scim_config = self.get_scim_config().unwrap_or_default();
@@ -1599,29 +1776,15 @@ impl AgentHandlerV2 for AuthAgent {
                 .and_then(|(_, v)| v.first())
                 .cloned();
 
-            let scim_authed = match auth_header {
-                Some(ref header) => {
-                    // Try static bearer token first
-                    if self.validate_scim_bearer_token(header).is_ok() {
-                        true
-                    } else if scim_config.use_oidc_auth {
-                        // Try OIDC validation
-                        let token =
-                            if header.starts_with("Bearer ") || header.starts_with("bearer ") {
-                                &header[7..]
-                            } else {
-                                ""
-                            };
-                        self.authenticate_oidc(token).await.is_ok()
-                    } else {
-                        false
-                    }
+            match self
+                .authorize_scim(&scim_config, auth_header.as_deref())
+                .await
+            {
+                ScimAuth::Allowed => {}
+                ScimAuth::Unauthenticated => return scim_error_response(401, "Unauthorized"),
+                ScimAuth::MissingScope => {
+                    return scim_error_response(403, "Token lacks the required SCIM scope")
                 }
-                None => false,
-            };
-
-            if !scim_authed {
-                return scim_error_response(401, "Unauthorized");
             }
 
             // Route the request
@@ -1710,6 +1873,7 @@ impl AgentHandlerV2 for AuthAgent {
                 &auth_method_header,
                 &request_method,
                 request_path,
+                &strip,
             );
         }
 
@@ -1727,6 +1891,7 @@ impl AgentHandlerV2 for AuthAgent {
                     &saml_config,
                     &user_id_header,
                     &auth_method_header,
+                    &strip,
                 );
             }
         }
@@ -1782,13 +1947,14 @@ impl AgentHandlerV2 for AuthAgent {
                         &auth_method_header,
                         &request_method,
                         request_path,
+                        &strip,
                     );
                 }
             }
         }
 
         // Try other authentication methods (JWT, API Key, Basic)
-        match self.authenticate(&event.headers) {
+        match self.authenticate(&event.headers).await {
             Ok(identity) => {
                 info!(
                     user_id = %identity.id,
@@ -1803,6 +1969,7 @@ impl AgentHandlerV2 for AuthAgent {
                     &auth_method_header,
                     &request_method,
                     request_path,
+                    &strip,
                 )
             }
             Err(e) => {
@@ -1822,7 +1989,9 @@ impl AgentHandlerV2 for AuthAgent {
 
                 if fail_open {
                     warn!("Authentication failed but fail_open is enabled, allowing request");
-                    AgentResponse::default_allow().with_audit(AuditMetadata {
+                    // Forwarded without an identity: the client must not be
+                    // able to supply one.
+                    allow_without_identity(&strip).with_audit(AuditMetadata {
                         tags: vec!["auth".to_string(), "fail_open".to_string()],
                         reason_codes: vec!["AUTH_FAILED_OPEN".to_string()],
                         ..Default::default()
@@ -2171,6 +2340,76 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Prefix of the per-claim headers the agent sets.
+const CLAIM_HEADER_PREFIX: &str = "X-Auth-Claim-";
+
+/// Every identity header name the agent may set on a request: the
+/// configured user-ID and auth-method headers, their default names, the
+/// SAML attribute headers, and each `X-Auth-Claim-*` header the client sent
+/// (the claim headers have open-ended names, so they are matched on the
+/// inbound request). Deduplicated case-insensitively.
+fn identity_header_names<'a>(
+    configured: &[&'a str],
+    attribute_headers: impl IntoIterator<Item = &'a String>,
+    inbound: &'a HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let prefix = CLAIM_HEADER_PREFIX.to_ascii_lowercase();
+    let mut names: Vec<String> = Vec::new();
+    let candidates = configured
+        .iter()
+        .copied()
+        .chain(["X-User-Id", "X-Auth-Method"])
+        .chain(attribute_headers.into_iter().map(String::as_str))
+        .chain(
+            inbound
+                .keys()
+                .map(String::as_str)
+                .filter(|k| k.to_ascii_lowercase().starts_with(&prefix)),
+        );
+    for name in candidates {
+        if !name.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// Allow the request, removing the given (client-supplied) identity headers
+/// first. Header operations apply in order, so identity headers set after
+/// this are the agent's own.
+fn allow_without_identity(strip: &[String]) -> AgentResponse {
+    strip
+        .iter()
+        .fold(AgentResponse::default_allow(), |r, name| {
+            r.add_request_header(HeaderOp::Remove { name: name.clone() })
+        })
+}
+
+/// The request's path (with query) and upper-cased method.
+///
+/// Read from the event's `uri` and `method`, which is where Zentinel puts
+/// them; the `:path`/`path` and `:method`/`method` headers are only a
+/// fallback for senders that leave `uri`/`method` empty.
+fn request_target(event: &RequestHeadersEvent) -> (String, String) {
+    let header = |names: [&str; 2]| {
+        names
+            .iter()
+            .find_map(|n| event.headers.get(*n).and_then(|v| v.first()))
+            .cloned()
+    };
+    let path = if event.uri.is_empty() {
+        header([":path", "path"]).unwrap_or_else(|| "/".to_string())
+    } else {
+        event.uri.clone()
+    };
+    let method = if event.method.is_empty() {
+        header([":method", "method"]).unwrap_or_default()
+    } else {
+        event.method.clone()
+    };
+    (path, method.to_uppercase())
+}
+
 /// Convert a ScimRoute to a string key for body buffering.
 fn route_key(route: &ScimRoute) -> String {
     match route {
@@ -2206,25 +2445,44 @@ fn parse_scim_buffer_key(key: &str) -> Option<ScimRoute> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zentinel_agent_protocol::{Decision, RequestMetadata};
+
+    fn request_event(
+        method: &str,
+        uri: &str,
+        headers: HashMap<String, Vec<String>>,
+    ) -> RequestHeadersEvent {
+        RequestHeadersEvent {
+            metadata: RequestMetadata {
+                correlation_id: "test-correlation".to_string(),
+                request_id: "test-request".to_string(),
+                client_ip: "127.0.0.1".to_string(),
+                client_port: 40000,
+                server_name: None,
+                protocol: "HTTP/1.1".to_string(),
+                tls_version: None,
+                tls_cipher: None,
+                route_id: None,
+                upstream_id: None,
+                timestamp: "2026-10-22T00:00:00Z".to_string(),
+                traceparent: None,
+            },
+            method: method.to_string(),
+            uri: uri.to_string(),
+            headers,
+        }
+    }
+
+    fn block_status(response: &AgentResponse) -> Option<u16> {
+        match response.decision {
+            Decision::Block { status, .. } => Some(status),
+            _ => None,
+        }
+    }
 
     fn test_config() -> AuthConfig {
-        let mut api_keys = HashMap::new();
-        api_keys.insert(
-            "test-key-123".to_string(),
-            ApiKeyInfo {
-                key: "test-key-123".to_string(),
-                name: "test-api".to_string(),
-            },
-        );
-
-        let mut basic_auth_users = HashMap::new();
-        basic_auth_users.insert(
-            "testuser".to_string(),
-            BasicAuthUser {
-                username: "testuser".to_string(),
-                password_hash: "testpass".to_string(),
-            },
-        );
+        let api_keys = parse_api_keys(["test-key-123:test-api"]);
+        let basic_auth_users = parse_basic_auth_users(["testuser:testpass"], true).unwrap();
 
         AuthConfig {
             jwt_secret: Some(b"test-secret-key-at-least-32-chars".to_vec()),
@@ -2241,15 +2499,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_api_key_auth() {
+    #[tokio::test]
+    async fn test_api_key_auth() {
         let config = test_config();
         let agent = AuthAgent::new(config, None, None);
 
         let mut headers = HashMap::new();
         headers.insert("X-API-Key".to_string(), vec!["test-key-123".to_string()]);
 
-        let result = agent.authenticate(&headers);
+        let result = agent.authenticate(&headers).await;
         assert!(result.is_ok());
 
         let identity = result.unwrap();
@@ -2257,8 +2515,8 @@ mod tests {
         assert_eq!(identity.id, "test-api");
     }
 
-    #[test]
-    fn test_basic_auth() {
+    #[tokio::test]
+    async fn test_basic_auth() {
         let config = test_config();
         let agent = AuthAgent::new(config, None, None);
 
@@ -2270,7 +2528,7 @@ mod tests {
             vec![format!("Basic {}", credentials)],
         );
 
-        let result = agent.authenticate(&headers);
+        let result = agent.authenticate(&headers).await;
         assert!(result.is_ok());
 
         let identity = result.unwrap();
@@ -2278,20 +2536,20 @@ mod tests {
         assert_eq!(identity.id, "testuser");
     }
 
-    #[test]
-    fn test_invalid_api_key() {
+    #[tokio::test]
+    async fn test_invalid_api_key() {
         let config = test_config();
         let agent = AuthAgent::new(config, None, None);
 
         let mut headers = HashMap::new();
         headers.insert("X-API-Key".to_string(), vec!["invalid-key".to_string()]);
 
-        let result = agent.authenticate(&headers);
+        let result = agent.authenticate(&headers).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_no_auth() {
+    #[tokio::test]
+    async fn test_no_auth() {
         let config = test_config();
         let agent = AuthAgent::new(config, None, None);
 
@@ -2301,7 +2559,7 @@ mod tests {
             vec!["application/json".to_string()],
         );
 
-        let result = agent.authenticate(&headers);
+        let result = agent.authenticate(&headers).await;
         assert!(result.is_err());
     }
 
@@ -2387,5 +2645,564 @@ mod tests {
         });
         assert!(agent.on_configure(config, None).await);
         assert_eq!(agent.config.read().unwrap().api_key_header, "X-Changed");
+    }
+
+    // OIDC: the token header does not choose the algorithm, unknown kids do
+    // not hammer the JWKS endpoint, and configuring never waits for it.
+
+    fn oidc_json(jwks_url: &str) -> serde_json::Value {
+        serde_json::json!({
+            "oidc": {
+                "enabled": true,
+                "issuer": oidc::test_support::TEST_ISSUER,
+                "jwks-url": jwks_url,
+                "jwks-fetch-timeout-ms": 300,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn configuring_oidc_does_not_wait_for_the_jwks_endpoint() {
+        let server = oidc::test_support::JwksServer::start_hanging().await;
+        let agent = AuthAgent::new(test_config(), None, None);
+        let started = std::time::Instant::now();
+        assert!(agent.on_configure(oidc_json(&server.url()), None).await);
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "on_configure waited {:?} for the JWKS endpoint",
+            started.elapsed()
+        );
+        // A token is rejected within the fetch timeout, not after 10 s.
+        let token = oidc::test_support::sign_rsa(
+            Algorithm::RS256,
+            Some(oidc::test_support::TEST_KID),
+            &oidc::test_support::test_claims("alice", serde_json::json!({})),
+        );
+        let started = std::time::Instant::now();
+        assert!(agent.authenticate_oidc(&token).await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn an_oidc_allowlist_naming_hs256_or_none_rejects_the_configuration() {
+        for alg in ["HS256", "none"] {
+            let agent = AuthAgent::new(test_config(), None, None);
+            let mut config = oidc_json("https://issuer.test/jwks.json");
+            config["oidc"]["allowed-algorithms"] = serde_json::json!(["RS256", alg]);
+            config["api-key-header"] = serde_json::json!("X-Changed");
+            assert!(!agent.on_configure(config, None).await, "{alg}");
+            assert_eq!(agent.config.read().unwrap().api_key_header, "X-API-Key");
+            assert!(!agent.get_oidc_config().unwrap().enabled);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_kid_flood_through_the_agent_fetches_once() {
+        use oidc::test_support::*;
+        let server = JwksServer::start().await;
+        let agent = AuthAgent::new(test_config(), None, None);
+        assert!(agent.on_configure(oidc_json(&server.url()), None).await);
+
+        let good = sign_rsa(
+            Algorithm::RS256,
+            Some(TEST_KID),
+            &test_claims("alice", serde_json::json!({})),
+        );
+        assert!(agent.authenticate_oidc(&good).await.is_ok());
+        let fetches = server.hits();
+        assert!(fetches >= 1);
+
+        for i in 0..300 {
+            let forged = sign_rsa(
+                Algorithm::RS256,
+                Some(&format!("unknown-{i}")),
+                &test_claims("mallory", serde_json::json!({})),
+            );
+            assert!(agent.authenticate_oidc(&forged).await.is_err());
+        }
+        assert_eq!(server.hits(), fetches, "unknown kids refetched the JWKS");
+    }
+
+    #[test]
+    fn the_request_target_comes_from_the_event_uri_and_method() {
+        let event = request_event("get", "/scim/v2/Users?count=1", HashMap::new());
+        assert_eq!(
+            request_target(&event),
+            ("/scim/v2/Users?count=1".to_string(), "GET".to_string())
+        );
+
+        let mut headers = HashMap::new();
+        headers.insert(":path".to_string(), vec!["/legacy".to_string()]);
+        headers.insert(":method".to_string(), vec!["post".to_string()]);
+        let event = request_event("", "", headers);
+        assert_eq!(
+            request_target(&event),
+            ("/legacy".to_string(), "POST".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn scim_routes_on_the_event_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(ScimUserStore::open(dir.path().join("scim.redb")).unwrap());
+        let agent = AuthAgent::new(test_config(), None, Some(store));
+        let config = serde_json::json!({
+            "scim": { "enabled": true, "bearer-token": "static-scim-token", "use-oidc-auth": false }
+        });
+        assert!(agent.on_configure(config, None).await);
+
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            vec!["Bearer static-scim-token".to_string()],
+        );
+        // As Zentinel sends it: the path in `uri`, no `:path` header.
+        let response = agent
+            .on_request_headers(request_event("GET", "/scim/v2/Users", headers))
+            .await;
+        assert_eq!(block_status(&response), Some(200));
+    }
+
+    // SCIM: an OIDC token proves identity, not the right to manage users.
+
+    fn scim_agent_config(jwks_url: &str) -> serde_json::Value {
+        let mut config = oidc_json(jwks_url);
+        config["scim"] = serde_json::json!({
+            "enabled": true,
+            "bearer-token": "static-scim-token",
+        });
+        config
+    }
+
+    async fn scim_auth_for(agent: &AuthAgent, header: Option<&str>) -> ScimAuth {
+        let scim_config = agent.get_scim_config().unwrap();
+        agent.authorize_scim(&scim_config, header).await
+    }
+
+    #[tokio::test]
+    async fn scim_refuses_an_oidc_token_without_the_scim_scope() {
+        use oidc::test_support::*;
+        let server = JwksServer::start().await;
+        let agent = AuthAgent::new(test_config(), None, None);
+        assert!(
+            agent
+                .on_configure(scim_agent_config(&server.url()), None)
+                .await
+        );
+
+        let plain_user = sign_rsa(
+            Algorithm::RS256,
+            Some(TEST_KID),
+            &test_claims("alice", serde_json::json!({ "scope": "openid profile" })),
+        );
+        // The token itself is valid for normal requests...
+        assert!(agent.authenticate_oidc(&plain_user).await.is_ok());
+        // ...but not for SCIM.
+        assert_eq!(
+            scim_auth_for(&agent, Some(&format!("Bearer {plain_user}"))).await,
+            ScimAuth::MissingScope
+        );
+
+        let admin = sign_rsa(
+            Algorithm::RS256,
+            Some(TEST_KID),
+            &test_claims("provisioner", serde_json::json!({ "scope": "openid scim" })),
+        );
+        assert_eq!(
+            scim_auth_for(&agent, Some(&format!("Bearer {admin}"))).await,
+            ScimAuth::Allowed
+        );
+
+        // Through the request path: 403 for the plain user.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            vec![format!("Bearer {plain_user}")],
+        );
+        let response = agent
+            .on_request_headers(request_event("GET", "/scim/v2/Users", headers))
+            .await;
+        assert_eq!(block_status(&response), Some(403));
+    }
+
+    #[tokio::test]
+    async fn scim_static_token_is_compared_exactly() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        assert!(
+            agent
+                .on_configure(scim_agent_config("https://issuer.test/jwks.json"), None)
+                .await
+        );
+        assert_eq!(
+            scim_auth_for(&agent, Some("Bearer static-scim-token")).await,
+            ScimAuth::Allowed
+        );
+        for wrong in [
+            "Bearer static-scim-tokeN",
+            "Bearer static-scim-token2",
+            "Bearer ",
+            "static-scim-token",
+        ] {
+            assert_eq!(
+                scim_auth_for(&agent, Some(wrong)).await,
+                ScimAuth::Unauthenticated,
+                "{wrong}"
+            );
+        }
+        assert_eq!(scim_auth_for(&agent, None).await, ScimAuth::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn scim_with_oidc_and_an_empty_scope_rejects_the_configuration() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let mut config = scim_agent_config("https://issuer.test/jwks.json");
+        config["scim"]["required-scope"] = serde_json::json!("");
+        assert!(!agent.on_configure(config, None).await);
+        assert!(!agent.get_scim_config().unwrap().enabled);
+        assert!(!agent.get_oidc_config().unwrap().enabled, "partly applied");
+    }
+
+    // Cedar: policies see the verified claims, and a policy that does not
+    // parse rejects the configuration instead of switching authorization off.
+
+    fn jwt_for(claims: serde_json::Value) -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"test-secret-key-at-least-32-chars"),
+        )
+        .unwrap()
+    }
+
+    fn bearer(token: &str) -> HashMap<String, Vec<String>> {
+        HashMap::from([("authorization".to_string(), vec![format!("Bearer {token}")])])
+    }
+
+    const ROLE_POLICY: &str = r#"
+        permit(principal, action == Action::"GET", resource)
+        when { resource.path like "/api/*" && context.roles.contains("reader") };
+        permit(principal, action, resource)
+        when { context.claims has org && context.claims.org == "acme"
+               && context.roles.contains("admin") };
+    "#;
+
+    #[tokio::test]
+    async fn cedar_policies_match_on_jwt_claims_and_roles() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let config = serde_json::json!({
+            "authz": { "enabled": true, "policy-inline": ROLE_POLICY, "roles-claim": "roles" }
+        });
+        assert!(agent.on_configure(config, None).await);
+
+        let exp = chrono::Utc::now().timestamp() + 600;
+        let reader = jwt_for(serde_json::json!({ "sub": "r", "exp": exp, "roles": ["reader"] }));
+        let admin = jwt_for(
+            serde_json::json!({ "sub": "a", "exp": exp, "roles": ["admin"], "org": "acme" }),
+        );
+        let other_org = jwt_for(
+            serde_json::json!({ "sub": "o", "exp": exp, "roles": ["admin"], "org": "evil" }),
+        );
+
+        let cases = [
+            (&reader, "GET", "/api/items", None),
+            (&reader, "DELETE", "/api/items", Some(403)),
+            (&reader, "GET", "/admin", Some(403)),
+            (&admin, "DELETE", "/admin", None),
+            (&other_org, "DELETE", "/admin", Some(403)),
+        ];
+        for (token, method, path, expected) in cases {
+            let response = agent
+                .on_request_headers(request_event(method, path, bearer(token)))
+                .await;
+            assert_eq!(block_status(&response), expected, "{method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cedar_policies_match_on_oidc_array_claims() {
+        use oidc::test_support::*;
+        let server = JwksServer::start().await;
+        let agent = AuthAgent::new(test_config(), None, None);
+        let mut config = oidc_json(&server.url());
+        config["authz"] = serde_json::json!({
+            "enabled": true, "policy-inline": ROLE_POLICY, "roles-claim": "roles"
+        });
+        assert!(agent.on_configure(config, None).await);
+
+        let token = sign_rsa(
+            Algorithm::RS256,
+            Some(TEST_KID),
+            &test_claims("alice", serde_json::json!({ "roles": ["reader"] })),
+        );
+        let response = agent
+            .on_request_headers(request_event("GET", "/api/items", bearer(&token)))
+            .await;
+        assert_eq!(block_status(&response), None);
+        let response = agent
+            .on_request_headers(request_event("POST", "/api/items", bearer(&token)))
+            .await;
+        assert_eq!(block_status(&response), Some(403));
+    }
+
+    #[tokio::test]
+    async fn a_cedar_policy_that_does_not_parse_rejects_the_configuration() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let config = serde_json::json!({
+            "api-key-header": "X-Changed",
+            "authz": { "enabled": true, "policy-inline": "permit(principal, action" }
+        });
+        assert!(!agent.on_configure(config, None).await);
+        assert_eq!(agent.config.read().unwrap().api_key_header, "X-API-Key");
+
+        // A later configuration that keeps a broken policy stays rejected,
+        // and a working one already in place is kept.
+        let good = serde_json::json!({
+            "authz": { "enabled": true, "policy-inline": "forbid(principal, action, resource);" }
+        });
+        assert!(agent.on_configure(good, None).await);
+        let broken = serde_json::json!({
+            "authz": { "enabled": true, "policy-inline": "this is not cedar" }
+        });
+        assert!(!agent.on_configure(broken, None).await);
+        let mut headers = HashMap::new();
+        headers.insert("X-API-Key".to_string(), vec!["test-key-123".to_string()]);
+        let response = agent
+            .on_request_headers(request_event("GET", "/", headers))
+            .await;
+        assert_eq!(
+            block_status(&response),
+            Some(403),
+            "the old forbid-all must still apply"
+        );
+
+        // Calling configure_authz directly with a broken policy is an error.
+        let broken = AuthzConfig {
+            enabled: true,
+            policy_inline: Some("nope".to_string()),
+            ..AuthzConfig::default()
+        };
+        assert!(agent.configure_authz(broken).is_err());
+    }
+
+    // Basic auth: bcrypt hashes, plain text only by opt-in; API keys and
+    // passwords compared in constant time.
+
+    // `htpasswd -nbB -C 4 alice s3cret`
+    const ALICE_BCRYPT: &str = "$2y$04$fqtNxPl7APYvfBv0y4Wt5.VI.B4ylGv6lyMXZlI6QCa/JVLPn6zAq";
+
+    fn basic(user: &str, pass: &str) -> HashMap<String, Vec<String>> {
+        HashMap::from([(
+            "authorization".to_string(),
+            vec![format!("Basic {}", BASE64.encode(format!("{user}:{pass}")))],
+        )])
+    }
+
+    #[tokio::test]
+    async fn basic_auth_with_a_bcrypt_hash() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let config = serde_json::json!({
+            "basic-auth-users": [format!("alice:{ALICE_BCRYPT}")]
+        });
+        assert!(agent.on_configure(config, None).await);
+
+        let ok = agent
+            .on_request_headers(request_event("GET", "/", basic("alice", "s3cret")))
+            .await;
+        assert_eq!(block_status(&ok), None);
+        // Again, from the verified cache.
+        let ok = agent
+            .on_request_headers(request_event("GET", "/", basic("alice", "s3cret")))
+            .await;
+        assert_eq!(block_status(&ok), None);
+
+        for (user, pass) in [
+            ("alice", "wrong"),
+            ("alice", ALICE_BCRYPT), // the hash itself is not the password
+            ("bob", "s3cret"),
+            ("testuser", "testpass"), // replaced by the new user list
+        ] {
+            let response = agent
+                .on_request_headers(request_event("GET", "/", basic(user, pass)))
+                .await;
+            assert_eq!(block_status(&response), Some(401), "{user}:{pass}");
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_basic_auth_passwords_need_an_explicit_opt_in() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let config = serde_json::json!({
+            "api-key-header": "X-Changed",
+            "basic-auth-users": ["alice:s3cret"]
+        });
+        assert!(!agent.on_configure(config, None).await);
+        assert_eq!(agent.config.read().unwrap().api_key_header, "X-API-Key");
+
+        let config = serde_json::json!({
+            "basic-auth-users": ["alice:s3cret"],
+            "basic-auth-allow-plaintext": true
+        });
+        assert!(agent.on_configure(config, None).await);
+        assert!(agent.authenticate(&basic("alice", "s3cret")).await.is_ok());
+        assert!(agent.authenticate(&basic("alice", "s3cre")).await.is_err());
+        assert!(agent
+            .authenticate(&basic("alice", "s3cret "))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn plaintext_basic_auth_on_the_command_line_needs_the_flag() {
+        let args = Args::parse_from(["zentinel-auth-agent", "--basic-auth-users", "alice:s3cret"]);
+        let err = AuthConfig::from_args(&args).err().unwrap();
+        assert!(
+            err.to_string().contains("basic-auth-allow-plaintext"),
+            "{err}"
+        );
+
+        let args = Args::parse_from([
+            "zentinel-auth-agent",
+            "--basic-auth-users",
+            "alice:s3cret",
+            "--basic-auth-allow-plaintext",
+        ]);
+        assert!(AuthConfig::from_args(&args).is_ok());
+
+        let hashed = format!("alice:{ALICE_BCRYPT}");
+        let args = Args::parse_from(["zentinel-auth-agent", "--basic-auth-users", &hashed]);
+        assert!(AuthConfig::from_args(&args).is_ok());
+    }
+
+    #[tokio::test]
+    async fn api_keys_are_not_kept_in_plain_text_and_must_match_exactly() {
+        let config = test_config();
+        assert!(!format!("{:?}", config.api_keys).contains("test-key-123"));
+        let agent = AuthAgent::new(config, None, None);
+        for wrong in ["test-key-12", "test-key-1234", "TEST-KEY-123", ""] {
+            let headers = HashMap::from([("X-API-Key".to_string(), vec![wrong.to_string()])]);
+            assert!(agent.authenticate(&headers).await.is_err(), "{wrong}");
+        }
+    }
+
+    // Client-supplied identity headers never reach the upstream, on any
+    // path that lets the request through.
+
+    fn forged_identity_headers() -> HashMap<String, Vec<String>> {
+        HashMap::from([
+            ("X-User-Id".to_string(), vec!["admin".to_string()]),
+            ("x-auth-method".to_string(), vec!["jwt".to_string()]),
+            ("x-auth-claim-role".to_string(), vec!["admin".to_string()]),
+            (
+                "X-Auth-Claim-api_key_name".to_string(),
+                vec!["root".to_string()],
+            ),
+            ("X-Custom-User".to_string(), vec!["admin".to_string()]),
+        ])
+    }
+
+    /// (op, lower-cased name) for each request header operation, in order.
+    fn header_ops(response: &AgentResponse) -> Vec<(&'static str, String)> {
+        response
+            .request_headers
+            .iter()
+            .map(|op| match op {
+                HeaderOp::Set { name, .. } => ("set", name.to_ascii_lowercase()),
+                HeaderOp::Add { name, .. } => ("add", name.to_ascii_lowercase()),
+                HeaderOp::Remove { name } => ("remove", name.to_ascii_lowercase()),
+            })
+            .collect()
+    }
+
+    fn removed(ops: &[(&str, String)], name: &str) -> bool {
+        ops.iter().any(|(op, n)| *op == "remove" && n == name)
+    }
+
+    #[tokio::test]
+    async fn fail_open_strips_client_supplied_identity_headers() {
+        let mut config = test_config();
+        config.fail_open = true;
+        let agent = AuthAgent::new(config, None, None);
+
+        let response = agent
+            .on_request_headers(request_event("GET", "/", forged_identity_headers()))
+            .await;
+        assert_eq!(block_status(&response), None, "fail-open lets it through");
+        let ops = header_ops(&response);
+        for name in [
+            "x-user-id",
+            "x-auth-method",
+            "x-auth-claim-role",
+            "x-auth-claim-api_key_name",
+        ] {
+            assert!(removed(&ops, name), "{name} not removed: {ops:?}");
+        }
+        assert!(
+            ops.iter().all(|(op, _)| *op == "remove"),
+            "no identity may be set: {ops:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_removes_forged_headers_before_setting_identity() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let mut headers = forged_identity_headers();
+        headers.insert("X-API-Key".to_string(), vec!["test-key-123".to_string()]);
+
+        let response = agent
+            .on_request_headers(request_event("GET", "/", headers))
+            .await;
+        assert_eq!(block_status(&response), None);
+        let ops = header_ops(&response);
+
+        assert!(removed(&ops, "x-auth-claim-role"), "{ops:?}");
+        for name in ["x-user-id", "x-auth-method", "x-auth-claim-api_key_name"] {
+            let remove = ops.iter().position(|(op, n)| *op == "remove" && n == name);
+            let set = ops.iter().position(|(op, n)| *op == "set" && n == name);
+            assert!(
+                matches!((remove, set), (Some(r), Some(s)) if r < s),
+                "{name}: remove must come before set: {ops:?}"
+            );
+        }
+        // The forged role is not re-set.
+        assert!(!ops
+            .iter()
+            .any(|(op, n)| *op == "set" && n == "x-auth-claim-role"));
+    }
+
+    #[tokio::test]
+    async fn configured_and_default_identity_header_names_are_both_stripped() {
+        let mut config = test_config();
+        config.fail_open = true;
+        config.user_id_header = "X-Custom-User".to_string();
+        let agent = AuthAgent::new(config, None, None);
+
+        let response = agent
+            .on_request_headers(request_event("GET", "/", forged_identity_headers()))
+            .await;
+        let ops = header_ops(&response);
+        assert!(removed(&ops, "x-custom-user"), "{ops:?}");
+        assert!(removed(&ops, "x-user-id"), "{ops:?}");
+    }
+
+    #[tokio::test]
+    async fn oidc_success_strips_forged_claim_headers() {
+        use oidc::test_support::*;
+        let server = JwksServer::start().await;
+        let agent = AuthAgent::new(test_config(), None, None);
+        assert!(agent.on_configure(oidc_json(&server.url()), None).await);
+        let token = sign_rsa(
+            Algorithm::RS256,
+            Some(TEST_KID),
+            &test_claims("alice", serde_json::json!({})),
+        );
+        let mut headers = forged_identity_headers();
+        headers.extend(bearer(&token));
+        let response = agent
+            .on_request_headers(request_event("GET", "/", headers))
+            .await;
+        assert_eq!(block_status(&response), None);
+        let ops = header_ops(&response);
+        assert!(removed(&ops, "x-auth-claim-role"), "{ops:?}");
+        assert!(removed(&ops, "x-user-id"), "{ops:?}");
     }
 }

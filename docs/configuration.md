@@ -24,14 +24,23 @@ The auth agent can be configured via command-line arguments, environment variabl
 
 | Option | Environment | Description | Default |
 |--------|-------------|-------------|---------|
-| `--api-keys` | `API_KEYS` | API keys as `key:name,key:name` | - |
+| `--api-keys` | `API_KEYS` | API keys as `key:name,key:name` (stored as SHA-256 digests, compared in constant time) | - |
 | `--api-key-header` | `API_KEY_HEADER` | Header name for API key | `X-API-Key` |
 
 ### Basic Auth Configuration
 
 | Option | Environment | Description | Default |
 |--------|-------------|-------------|---------|
-| `--basic-auth-users` | `BASIC_AUTH_USERS` | Users as `user:pass,user:pass` | - |
+| `--basic-auth-users` | `BASIC_AUTH_USERS` | Users as `user:bcrypt-hash,user:bcrypt-hash` | - |
+| `--basic-auth-allow-plaintext` | `BASIC_AUTH_ALLOW_PLAINTEXT` | Also accept plain-text passwords (logged as a warning) | `false` |
+
+Passwords are bcrypt hashes (`$2a$`, `$2b$` or `$2y$`), for example from
+`htpasswd -nbB alice 'her password'` (the part after `alice:`). A password
+that is not a bcrypt hash is refused, at startup or in `on_configure`, unless
+plain text is explicitly allowed. bcrypt runs on a blocking thread, and an
+unknown user costs a bcrypt run too, so response times do not reveal which
+users exist. After a successful login the SHA-256 digest of that password is
+kept in memory, so the same client does not pay for bcrypt on every request.
 
 ### Output Headers
 
@@ -76,7 +85,7 @@ agents {
             api-key-header "X-API-Key"
 
             // Basic auth
-            basic-auth-users "admin:secret,readonly:password"
+            basic-auth-users "admin:$2y$05$.HcI1U00u7WsD57ZPF7srekYacO7PpkJB4VG5R31cAjiK8a5ovGCW"
 
             // Output headers
             user-id-header "X-User-Id"
@@ -108,9 +117,10 @@ agents {
   "jwt-algorithm": "HS256 | RS256 | ES256",
   "jwt-issuer": "string",
   "jwt-audience": "string",
-  "api-keys": "key:name,key:name",
+  "api-keys": ["key:name"],
   "api-key-header": "string",
-  "basic-auth-users": "user:pass,user:pass",
+  "basic-auth-users": ["user:bcrypt-hash"],
+  "basic-auth-allow-plaintext": "boolean (default false)",
   "user-id-header": "string",
   "auth-method-header": "string",
   "fail-open": "boolean",
@@ -173,6 +183,9 @@ See [OIDC Authentication](oidc.md) for detailed setup guide.
 | `audience` | string | - | Expected audience claim |
 | `required-scopes` | array | `[]` | Scopes that must be present |
 | `jwks-refresh-secs` | int | `3600` | JWKS cache refresh interval |
+| `jwks-min-refetch-secs` | int | `60` | Minimum time between JWKS fetches (unknown `kid`s do not refetch more often) |
+| `jwks-fetch-timeout-ms` | int | `5000` | Timeout for one JWKS fetch; configuring never waits for it |
+| `allowed-algorithms` | array | `[]` | Allowed token algorithms; empty means those the JWKS keys declare. `none`/`HS*` are rejected |
 | `clock-skew-secs` | int | `30` | Clock skew tolerance |
 
 ## mTLS Configuration
@@ -318,7 +331,7 @@ See [SCIM Provisioning](scim.md) for detailed guide and IdP setup instructions.
 | `base-path` | string | `/scim/v2` | Base path for SCIM endpoints |
 | `bearer-token` | string | - | Static bearer token for SCIM auth |
 | `use-oidc-auth` | bool | `true` | Use OIDC token validation for SCIM auth |
-| `required-scope` | string | - | Required OAuth scope (e.g. `scim:write`) |
+| `required-scope` | string | `scim` | Scope an OIDC token must carry to use SCIM. Cannot be empty while `use-oidc-auth` is on |
 | `store-path` | string | `/var/lib/zentinel-auth/scim_users.redb` | Path to SCIM user database |
 | `enforce-active-status` | bool | `true` | Block deactivated SCIM users during OIDC auth |
 | `location-base-url` | string | - | Base URL for `meta.location` URLs |
@@ -339,7 +352,7 @@ export JWT_PUBLIC_KEY="/etc/zentinel/jwt-public.pem"
 export API_KEYS="sk_live_abc123:production,sk_test_xyz:development"
 
 # Basic Auth
-export BASIC_AUTH_USERS="admin:supersecret,readonly:readpass"
+export BASIC_AUTH_USERS='admin:$2y$05$.HcI1U00u7WsD57ZPF7srekYacO7PpkJB4VG5R31cAjiK8a5ovGCW'
 
 # Headers
 export USER_ID_HEADER="X-User-Id"
@@ -353,6 +366,15 @@ export SCIM_STORE_PATH="/var/lib/zentinel-auth/scim_users.redb"
 ```
 
 ## Headers Added to Requests
+
+Every request the agent lets through, on every path including
+`--fail-open`, first has these headers removed: the configured user-ID and
+auth-method headers, their default names `X-User-Id` and `X-Auth-Method`, the
+SAML attribute headers, and every `X-Auth-Claim-*` header the client sent.
+Only then are the agent's own identity headers set, so an upstream never
+sees an identity the client made up. (If the agent itself is unreachable and
+the filter's `failure-mode` is `"open"`, Zentinel forwards the request
+without asking the agent, and nothing is removed.)
 
 On successful authentication, the agent adds these headers:
 
@@ -404,7 +426,7 @@ When multiple auth methods are configured, they are checked in this order:
 5. **API Key header** - if configured header present
 6. **Authorization: Basic** - if header present
 
-The first successful authentication wins. If all methods fail, the agent returns 401 (or allows the request if `fail-open` is true).
+The first successful authentication wins. If all methods fail, the agent returns 401 (or allows the request if `fail-open` is true, with the identity headers removed and none set).
 
 After authentication, if authorization is enabled, the Cedar policy engine evaluates the request. A 403 Forbidden is returned if the policy denies access.
 

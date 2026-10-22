@@ -126,20 +126,28 @@ reach the modules listed under [How it works](#how-it-works).)
 | `--jwt-algorithm` | `HS256` | One of `HS256`, `HS384`, `HS512`, `RS256`, `RS384`, `RS512`, `ES256`, `ES384`. Env `JWT_ALGORITHM`. |
 | `--jwt-issuer` | unset | Required `iss`; not checked when unset. Env `JWT_ISSUER`. |
 | `--jwt-audience` | unset | Required `aud`; not checked when unset. Env `JWT_AUDIENCE`. |
-| `--api-keys` | unset | `key:name` pairs, comma-separated; `name` becomes the user ID. Env `API_KEYS`. |
+| `--api-keys` | unset | `key:name` pairs, comma-separated; `name` becomes the user ID. Keys are kept only as SHA-256 digests and compared in constant time. Env `API_KEYS`. |
 | `--api-key-header` | `X-API-Key` | Header that carries the API key. Env `API_KEY_HEADER`. |
-| `--basic-auth-users` | unset | `user:password` pairs, comma-separated. Passwords are compared in plain text. Env `BASIC_AUTH_USERS`. |
+| `--basic-auth-users` | unset | `user:hash` pairs, comma-separated, where `hash` is a bcrypt hash (`$2a$`/`$2b$`/`$2y$`, e.g. from `htpasswd -nbB user password`). A plain-text password is refused at startup unless `--basic-auth-allow-plaintext` is set. Env `BASIC_AUTH_USERS`. |
+| `--basic-auth-allow-plaintext` | `false` | Accept plain-text passwords in `--basic-auth-users` (compared in constant time; a warning is logged). Not recommended. Env `BASIC_AUTH_ALLOW_PLAINTEXT`. |
 | `--user-id-header` | `X-User-Id` | Request header set to the authenticated user ID. Env `USER_ID_HEADER`. |
 | `--auth-method-header` | `X-Auth-Method` | Request header set to the method used (`jwt`, `api_key`, `basic`, ...). Env `AUTH_METHOD_HEADER`. |
 | `--fail-open` | `false` | Forward requests that fail authentication instead of answering 401. Env `FAIL_OPEN`. |
 | `-v`, `--verbose` | `false` | Debug logging (JSON). Env `AUTH_VERBOSE`. |
 
 On success the agent also sets `X-Auth-Claim-<name>` for every string-valued
-JWT claim (for example `X-Auth-Claim-sub`). It does not remove headers the
-client sent, so with `--fail-open` an unauthenticated request reaches the
-upstream with whatever `X-User-Id` or `X-Auth-Claim-*` headers the client put
-on it. Prefer passing secrets through the environment rather than the command
-line.
+JWT claim (for example `X-Auth-Claim-sub`).
+
+Every request the agent lets through, on every path including
+`--fail-open`, first has these headers removed: the configured user-ID and
+auth-method headers, their default names `X-User-Id` and `X-Auth-Method`, the
+SAML attribute headers, and every `X-Auth-Claim-*` header the client sent.
+Only then are the agent's own identity headers set, so an upstream never
+sees an identity the client made up. (If the agent itself is unreachable and
+the filter's `failure-mode` is `"open"`, Zentinel forwards the request
+without asking the agent, and nothing is removed.)
+
+Prefer passing secrets through the environment rather than the command line.
 
 Full reference: <https://registry.zentinelproxy.io/auth/>
 
@@ -152,11 +160,18 @@ The code also contains these modules. Their settings are read only from
 `on_configure`, which Zentinel 0.6.50 does not send, so none of them can be
 turned on from a Zentinel config today. Treat them as experimental:
 
-- OIDC: bearer tokens checked against a JWKS fetched from a configured URL and refreshed periodically.
-- Cedar authorization (partial): policies see the principal, the HTTP method
-  as the action and the path as the resource, with no entity attributes or
-  context, so policies on roles or claims do not match.
-- SCIM 2.0 user store (redb) that can block deactivated OIDC users.
+- OIDC: bearer tokens checked against a JWKS fetched in the background from a
+  configured URL. The token's `alg` must be in `allowed-algorithms` (default:
+  what the JWKS keys declare; never `none` or `HS*`), and unknown `kid`s
+  refetch the JWKS at most once per `jwks-min-refetch-secs`.
+- Cedar authorization: policies see the principal (with `id`), the HTTP
+  method as the action, the path as the resource (with `path`), and a context
+  with the verified claims, the roles claim, the auth method, method, path
+  and hour. A policy that does not parse rejects the configuration; a policy
+  that errors during evaluation denies the request.
+- SCIM 2.0 user store (redb) that can block deactivated OIDC users. Its
+  endpoint takes the static bearer token (compared in constant time) or an
+  OIDC token carrying `required-scope` (default `scim`; cannot be empty).
 
 **Refused:** a configuration that enables SAML, mTLS or token exchange is
 rejected whole (`on_configure` returns false, nothing of it is applied),
