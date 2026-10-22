@@ -136,11 +136,18 @@ reach the modules listed under [How it works](#how-it-works).)
 | `-v`, `--verbose` | `false` | Debug logging (JSON). Env `AUTH_VERBOSE`. |
 
 On success the agent also sets `X-Auth-Claim-<name>` for every string-valued
-JWT claim (for example `X-Auth-Claim-sub`). It does not remove headers the
-client sent, so with `--fail-open` an unauthenticated request reaches the
-upstream with whatever `X-User-Id` or `X-Auth-Claim-*` headers the client put
-on it. Prefer passing secrets through the environment rather than the command
-line.
+JWT claim (for example `X-Auth-Claim-sub`).
+
+Every request the agent lets through, on every path including
+`--fail-open`, first has these headers removed: the configured user-ID and
+auth-method headers, their default names `X-User-Id` and `X-Auth-Method`, the
+SAML attribute headers, and every `X-Auth-Claim-*` header the client sent.
+Only then are the agent's own identity headers set, so an upstream never
+sees an identity the client made up. (If the agent itself is unreachable and
+the filter's `failure-mode` is `"open"`, Zentinel forwards the request
+without asking the agent, and nothing is removed.)
+
+Prefer passing secrets through the environment rather than the command line.
 
 Full reference: <https://registry.zentinelproxy.io/auth/>
 

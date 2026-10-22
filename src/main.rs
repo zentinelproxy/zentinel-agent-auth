@@ -1083,8 +1083,9 @@ impl AuthAgent {
         saml_config: &SamlConfig,
         user_id_header: &str,
         auth_method_header: &str,
+        strip: &[String],
     ) -> AgentResponse {
-        let mut response = AgentResponse::default_allow()
+        let mut response = allow_without_identity(strip)
             .add_request_header(HeaderOp::Set {
                 name: user_id_header.to_string(),
                 value: identity.id.clone(),
@@ -1108,7 +1109,7 @@ impl AuthAgent {
         for (key, value) in &identity.claims {
             if let serde_json::Value::String(s) = value {
                 response = response.add_request_header(HeaderOp::Set {
-                    name: format!("X-Auth-Claim-{}", key),
+                    name: format!("{CLAIM_HEADER_PREFIX}{key}"),
                     value: s.clone(),
                 });
             }
@@ -1128,12 +1129,14 @@ impl AuthAgent {
         auth_method_header: &str,
         request_method: &str,
         request_path: &str,
+        strip: &[String],
     ) -> AgentResponse {
         // Check authorization
         match self.check_authorization(&identity, request_method, request_path) {
             Ok(true) => {
-                // Authorized - build success response
-                let mut response = AgentResponse::default_allow()
+                // Authorized - build success response. Client-supplied
+                // identity headers are removed before ours are set.
+                let mut response = allow_without_identity(strip)
                     .add_request_header(HeaderOp::Set {
                         name: user_id_header.to_string(),
                         value: identity.id.clone(),
@@ -1147,7 +1150,7 @@ impl AuthAgent {
                 for (key, value) in &identity.claims {
                     if let serde_json::Value::String(s) = value {
                         response = response.add_request_header(HeaderOp::Set {
-                            name: format!("X-Auth-Claim-{}", key),
+                            name: format!("{CLAIM_HEADER_PREFIX}{key}"),
                             value: s.clone(),
                         });
                     }
@@ -1747,6 +1750,13 @@ impl AgentHandlerV2 for AuthAgent {
         // Get SAML config
         let saml_config = self.get_saml_config().unwrap_or_default();
 
+        // Identity headers to remove from every request let through.
+        let strip = identity_header_names(
+            &[&user_id_header, &auth_method_header],
+            saml_config.attribute_mapping.values(),
+            &event.headers,
+        );
+
         // Get request path and method for matching. Zentinel moves the
         // `:path` and `:method` pseudo-headers into `uri` and `method` and
         // removes them from `headers`.
@@ -1863,6 +1873,7 @@ impl AgentHandlerV2 for AuthAgent {
                 &auth_method_header,
                 &request_method,
                 request_path,
+                &strip,
             );
         }
 
@@ -1880,6 +1891,7 @@ impl AgentHandlerV2 for AuthAgent {
                     &saml_config,
                     &user_id_header,
                     &auth_method_header,
+                    &strip,
                 );
             }
         }
@@ -1935,6 +1947,7 @@ impl AgentHandlerV2 for AuthAgent {
                         &auth_method_header,
                         &request_method,
                         request_path,
+                        &strip,
                     );
                 }
             }
@@ -1956,6 +1969,7 @@ impl AgentHandlerV2 for AuthAgent {
                     &auth_method_header,
                     &request_method,
                     request_path,
+                    &strip,
                 )
             }
             Err(e) => {
@@ -1975,7 +1989,9 @@ impl AgentHandlerV2 for AuthAgent {
 
                 if fail_open {
                     warn!("Authentication failed but fail_open is enabled, allowing request");
-                    AgentResponse::default_allow().with_audit(AuditMetadata {
+                    // Forwarded without an identity: the client must not be
+                    // able to supply one.
+                    allow_without_identity(&strip).with_audit(AuditMetadata {
                         tags: vec!["auth".to_string(), "fail_open".to_string()],
                         reason_codes: vec!["AUTH_FAILED_OPEN".to_string()],
                         ..Default::default()
@@ -2322,6 +2338,51 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Prefix of the per-claim headers the agent sets.
+const CLAIM_HEADER_PREFIX: &str = "X-Auth-Claim-";
+
+/// Every identity header name the agent may set on a request: the
+/// configured user-ID and auth-method headers, their default names, the
+/// SAML attribute headers, and each `X-Auth-Claim-*` header the client sent
+/// (the claim headers have open-ended names, so they are matched on the
+/// inbound request). Deduplicated case-insensitively.
+fn identity_header_names<'a>(
+    configured: &[&'a str],
+    attribute_headers: impl IntoIterator<Item = &'a String>,
+    inbound: &'a HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let prefix = CLAIM_HEADER_PREFIX.to_ascii_lowercase();
+    let mut names: Vec<String> = Vec::new();
+    let candidates = configured
+        .iter()
+        .copied()
+        .chain(["X-User-Id", "X-Auth-Method"])
+        .chain(attribute_headers.into_iter().map(String::as_str))
+        .chain(
+            inbound
+                .keys()
+                .map(String::as_str)
+                .filter(|k| k.to_ascii_lowercase().starts_with(&prefix)),
+        );
+    for name in candidates {
+        if !name.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// Allow the request, removing the given (client-supplied) identity headers
+/// first. Header operations apply in order, so identity headers set after
+/// this are the agent's own.
+fn allow_without_identity(strip: &[String]) -> AgentResponse {
+    strip
+        .iter()
+        .fold(AgentResponse::default_allow(), |r, name| {
+            r.add_request_header(HeaderOp::Remove { name: name.clone() })
+        })
 }
 
 /// The request's path (with query) and upper-cased method.
@@ -3021,5 +3082,127 @@ mod tests {
             let headers = HashMap::from([("X-API-Key".to_string(), vec![wrong.to_string()])]);
             assert!(agent.authenticate(&headers).await.is_err(), "{wrong}");
         }
+    }
+
+    // Client-supplied identity headers never reach the upstream, on any
+    // path that lets the request through.
+
+    fn forged_identity_headers() -> HashMap<String, Vec<String>> {
+        HashMap::from([
+            ("X-User-Id".to_string(), vec!["admin".to_string()]),
+            ("x-auth-method".to_string(), vec!["jwt".to_string()]),
+            ("x-auth-claim-role".to_string(), vec!["admin".to_string()]),
+            (
+                "X-Auth-Claim-api_key_name".to_string(),
+                vec!["root".to_string()],
+            ),
+            ("X-Custom-User".to_string(), vec!["admin".to_string()]),
+        ])
+    }
+
+    /// (op, lower-cased name) for each request header operation, in order.
+    fn header_ops(response: &AgentResponse) -> Vec<(&'static str, String)> {
+        response
+            .request_headers
+            .iter()
+            .map(|op| match op {
+                HeaderOp::Set { name, .. } => ("set", name.to_ascii_lowercase()),
+                HeaderOp::Add { name, .. } => ("add", name.to_ascii_lowercase()),
+                HeaderOp::Remove { name } => ("remove", name.to_ascii_lowercase()),
+            })
+            .collect()
+    }
+
+    fn removed(ops: &[(&str, String)], name: &str) -> bool {
+        ops.iter().any(|(op, n)| *op == "remove" && n == name)
+    }
+
+    #[tokio::test]
+    async fn fail_open_strips_client_supplied_identity_headers() {
+        let mut config = test_config();
+        config.fail_open = true;
+        let agent = AuthAgent::new(config, None, None);
+
+        let response = agent
+            .on_request_headers(request_event("GET", "/", forged_identity_headers()))
+            .await;
+        assert_eq!(block_status(&response), None, "fail-open lets it through");
+        let ops = header_ops(&response);
+        for name in [
+            "x-user-id",
+            "x-auth-method",
+            "x-auth-claim-role",
+            "x-auth-claim-api_key_name",
+        ] {
+            assert!(removed(&ops, name), "{name} not removed: {ops:?}");
+        }
+        assert!(
+            ops.iter().all(|(op, _)| *op == "remove"),
+            "no identity may be set: {ops:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_removes_forged_headers_before_setting_identity() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let mut headers = forged_identity_headers();
+        headers.insert("X-API-Key".to_string(), vec!["test-key-123".to_string()]);
+
+        let response = agent
+            .on_request_headers(request_event("GET", "/", headers))
+            .await;
+        assert_eq!(block_status(&response), None);
+        let ops = header_ops(&response);
+
+        assert!(removed(&ops, "x-auth-claim-role"), "{ops:?}");
+        for name in ["x-user-id", "x-auth-method", "x-auth-claim-api_key_name"] {
+            let remove = ops.iter().position(|(op, n)| *op == "remove" && n == name);
+            let set = ops.iter().position(|(op, n)| *op == "set" && n == name);
+            assert!(
+                matches!((remove, set), (Some(r), Some(s)) if r < s),
+                "{name}: remove must come before set: {ops:?}"
+            );
+        }
+        // The forged role is not re-set.
+        assert!(!ops
+            .iter()
+            .any(|(op, n)| *op == "set" && n == "x-auth-claim-role"));
+    }
+
+    #[tokio::test]
+    async fn configured_and_default_identity_header_names_are_both_stripped() {
+        let mut config = test_config();
+        config.fail_open = true;
+        config.user_id_header = "X-Custom-User".to_string();
+        let agent = AuthAgent::new(config, None, None);
+
+        let response = agent
+            .on_request_headers(request_event("GET", "/", forged_identity_headers()))
+            .await;
+        let ops = header_ops(&response);
+        assert!(removed(&ops, "x-custom-user"), "{ops:?}");
+        assert!(removed(&ops, "x-user-id"), "{ops:?}");
+    }
+
+    #[tokio::test]
+    async fn oidc_success_strips_forged_claim_headers() {
+        use oidc::test_support::*;
+        let server = JwksServer::start().await;
+        let agent = AuthAgent::new(test_config(), None, None);
+        assert!(agent.on_configure(oidc_json(&server.url()), None).await);
+        let token = sign_rsa(
+            Algorithm::RS256,
+            Some(TEST_KID),
+            &test_claims("alice", serde_json::json!({})),
+        );
+        let mut headers = forged_identity_headers();
+        headers.extend(bearer(&token));
+        let response = agent
+            .on_request_headers(request_event("GET", "/", headers))
+            .await;
+        assert_eq!(block_status(&response), None);
+        let ops = header_ops(&response);
+        assert!(removed(&ops, "x-auth-claim-role"), "{ops:?}");
+        assert!(removed(&ops, "x-user-id"), "{ops:?}");
     }
 }

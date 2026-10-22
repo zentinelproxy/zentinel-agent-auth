@@ -367,6 +367,15 @@ export SCIM_STORE_PATH="/var/lib/zentinel-auth/scim_users.redb"
 
 ## Headers Added to Requests
 
+Every request the agent lets through, on every path including
+`--fail-open`, first has these headers removed: the configured user-ID and
+auth-method headers, their default names `X-User-Id` and `X-Auth-Method`, the
+SAML attribute headers, and every `X-Auth-Claim-*` header the client sent.
+Only then are the agent's own identity headers set, so an upstream never
+sees an identity the client made up. (If the agent itself is unreachable and
+the filter's `failure-mode` is `"open"`, Zentinel forwards the request
+without asking the agent, and nothing is removed.)
+
 On successful authentication, the agent adds these headers:
 
 | Header | Description | Auth Methods |
@@ -417,7 +426,7 @@ When multiple auth methods are configured, they are checked in this order:
 5. **API Key header** - if configured header present
 6. **Authorization: Basic** - if header present
 
-The first successful authentication wins. If all methods fail, the agent returns 401 (or allows the request if `fail-open` is true).
+The first successful authentication wins. If all methods fail, the agent returns 401 (or allows the request if `fail-open` is true, with the identity headers removed and none set).
 
 After authentication, if authorization is enabled, the Cedar policy engine evaluates the request. A 403 Forbidden is returned if the policy denies access.
 
