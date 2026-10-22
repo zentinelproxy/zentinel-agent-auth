@@ -59,6 +59,7 @@ use session::{spawn_cleanup_task, SessionId, SessionStore, DEFAULT_CLEANUP_INTER
 #[derive(Parser, Debug)]
 #[command(name = "zentinel-auth-agent")]
 #[command(about = "Authentication agent for Zentinel reverse proxy")]
+#[command(version)]
 struct Args {
     /// Path to Unix socket (for UDS transport)
     #[arg(long, default_value = "/tmp/zentinel-auth.sock", env = "AGENT_SOCKET")]

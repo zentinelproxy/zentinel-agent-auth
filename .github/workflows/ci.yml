@@ -77,3 +77,21 @@ jobs:
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config libxml2-dev libxmlsec1-dev
       - run: cargo test --workspace
+
+  # The release pipeline on one platform, without publishing: builds the
+  # release binary with --locked and runs scripts/smoke-test.sh behind the
+  # latest Zentinel release, so a change that would break a release fails
+  # here first. Switch both refs to v1 once zentinelproxy/.github is tagged.
+  smoke:
+    name: Smoke
+    uses: zentinelproxy/.github/.github/workflows/agent-release.yml@v1
+    permissions:
+      contents: read
+    with:
+      binary: zentinel-auth-agent
+      # The CI jobs install the same packages.
+      apt-packages: protobuf-compiler pkg-config libxml2-dev libxmlsec1-dev
+      smoke-command: scripts/smoke-test.sh
+      harness-ref: v1
+      platforms: '["linux-x86_64"]'
+      cache: true
