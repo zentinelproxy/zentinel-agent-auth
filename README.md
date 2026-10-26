@@ -91,9 +91,11 @@ curl http://localhost:8080/                                   # 401
 
 ## Install
 
-Not in the Zentinel bundle yet: the bundle API does not list it, and the
-`v0.2.0` release has no asset in the bundle's naming scheme, so
-`zentinel bundle install auth` fails.
+In the Zentinel bundle from 26.10_8: `zentinel bundle install auth` installs
+the `0.3.0` release the bundle lock pins, built from its tag and smoke-tested
+behind a real Zentinel for `linux-x86_64`, `linux-aarch64` and
+`darwin-aarch64`. Zentinel binaries up to 0.6.50 (26.10_7) keep a compiled-in
+lock that does not list auth, so there the command fails.
 
 ### From source (recommended)
 
@@ -112,10 +114,11 @@ docker build -t zentinel-auth-agent .
 
 ## Configuration
 
-Zentinel 0.6.50 does not forward an `agent { config { ... } }` block to
-agents, so configure the agent with the flags below. (The agent also accepts
-configuration over the protocol, `on_configure`, which is the only way to
-reach the modules listed under [How it works](#how-it-works).)
+The flags below set the agent's startup settings. Zentinel 26.10_8 and later
+also send the agent block's `config { }` on every connection (releases up to
+0.6.50 never did), and the agent applies it over the flags; see "Settings
+from the proxy" below. That block is the only way to reach the modules listed
+under [How it works](#how-it-works).
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -149,6 +152,41 @@ without asking the agent, and nothing is removed.)
 
 Prefer passing secrets through the environment rather than the command line.
 
+### Settings from the proxy (`config { }`)
+
+Zentinel 26.10_8 and later send the agent block's `config { }` on every
+connection: once per pooled connection at startup and again on every
+reconnect. The agent must answer each one. Keys: `jwt-secret`,
+`jwt-algorithm`, `jwt-issuer`, `jwt-audience`, `api-keys`, `api-key-header`,
+`basic-auth-users`, `basic-auth-allow-plaintext`, `user-id-header`,
+`auth-method-header`, `fail-open`, and the `oidc`, `authz` and `scim` tables
+(`saml`, `mtls` and `token-exchange` exist but are refused when enabled, see
+[How it works](#how-it-works)). There is no key for `--jwt-public-key`.
+
+- A key the block sets replaces the flag of the same name; a key it leaves
+  out keeps the flag's value, with one exception: `fail-open` is taken from
+  the block as is, so a block that leaves it out sets `fail-open` to `false`
+  even when the agent was started with `--fail-open`.
+- `api-keys` and `basic-auth-users` are lists: give several arguments. A
+  single argument arrives as a string, which the agent rejects.
+- A block that does not parse, fails validation (OIDC, Cedar policies, SCIM,
+  Basic auth users) or enables SAML, mTLS or token exchange is rejected
+  whole: `on_configure` returns false, nothing of it is applied, and the
+  proxy does not use the agent (the connection fails with an ERROR log and is
+  retried; meanwhile its filters' `failure-mode` applies, `closed` answering
+  503).
+
+```kdl
+agent "auth" type="auth" {
+    unix-socket "/tmp/zentinel-auth.sock"
+    events "request_headers"
+    config {
+        jwt-issuer "https://issuer.example"
+        api-keys "sk_live_abc123:production" "sk_test_def456:staging"
+    }
+}
+```
+
 Full reference: <https://registry.zentinelproxy.io/auth/>
 
 ## How it works
@@ -156,9 +194,10 @@ Full reference: <https://registry.zentinelproxy.io/auth/>
 For each request the agent tries, in order: a `Bearer` token as JWT, a
 `Basic` credential, then the API key header. The first that validates wins.
 
-The code also contains these modules. Their settings are read only from
-`on_configure`, which Zentinel 0.6.50 does not send, so none of them can be
-turned on from a Zentinel config today. Treat them as experimental:
+The code also contains these modules. Their settings are read only from the
+agent block's `config { }` (`on_configure`), which Zentinel sends from 26.10_8
+(releases up to 0.6.50 never did), so they can now be turned on from a
+Zentinel config. Treat them as experimental:
 
 - OIDC: bearer tokens checked against a JWKS fetched in the background from a
   configured URL. The token's `alg` must be in `allowed-algorithms` (default:
@@ -174,8 +213,9 @@ turned on from a Zentinel config today. Treat them as experimental:
   OIDC token carrying `required-scope` (default `scim`; cannot be empty).
 
 **Refused:** a configuration that enables SAML, mTLS or token exchange is
-rejected whole (`on_configure` returns false, nothing of it is applied),
-because these modules do not verify what they trust
+rejected whole (`on_configure` returns false, nothing of it is applied, and
+Zentinel 26.10_8 then does not use the agent: its routes follow their
+`failure-mode`), because these modules do not verify what they trust
 ([#6](https://github.com/zentinelproxy/zentinel-agent-auth/issues/6)):
 
 - SAML does not verify the assertion's XML signature, so a forged response
@@ -188,7 +228,7 @@ because these modules do not verify what they trust
 They stay refused until that verification exists.
 
 Notes on these modules are in [`docs/`](docs/); their examples use the
-proxy's `config` block, which is not forwarded.
+proxy's `config { }` block, which Zentinel sends from 26.10_8.
 
 ## Development
 
