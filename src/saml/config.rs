@@ -223,6 +223,23 @@ impl SamlConfig {
             );
         }
 
+        // Signatures are verified against this certificate; without one there
+        // is nothing to verify against. (idp_metadata_url is not fetched.)
+        if self.idp_certificate_pem.is_none() && self.idp_metadata_xml.is_none() {
+            return Err(
+                "SAML requires the IdP signing certificate: idp_certificate_pem or idp_metadata_xml"
+                    .to_string(),
+            );
+        }
+
+        if self.allow_unsigned_assertions {
+            return Err(
+                "SAML allow_unsigned_assertions is not supported: every response must be signed \
+                 by the IdP"
+                    .to_string(),
+            );
+        }
+
         Ok(())
     }
 
@@ -441,7 +458,13 @@ mod tests {
 
         config.idp_sso_url = Some("https://idp.example.com/sso".to_string());
         config.idp_entity_id = Some("https://idp.example.com".to_string());
+        assert!(config.validate().is_err()); // missing IdP signing certificate
+
+        config.idp_certificate_pem = Some("-----BEGIN CERTIFICATE-----".to_string());
         assert!(config.validate().is_ok());
+
+        config.allow_unsigned_assertions = true;
+        assert!(config.validate().is_err()); // unsigned assertions are refused
     }
 
     #[test]

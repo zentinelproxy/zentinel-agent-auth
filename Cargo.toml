@@ -57,6 +57,9 @@ tower-http = { version = "0.6", features = ["trace"] }
 
 # SAML authentication (xmlsec feature requires system libxmlsec1)
 samael = "0.0.19"
+# Same libxml2 parser xmlsec verifies with, for the structural checks on a
+# SAML response (src/saml/verify.rs)
+libxml = "0.3"
 
 # Session storage (embedded KV store)
 redb = "2.0"

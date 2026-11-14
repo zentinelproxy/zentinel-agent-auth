@@ -1,9 +1,17 @@
 # SAML Authentication
 
-> **Disabled.** The agent rejects a configuration that enables this module:
-> it does not verify what it trusts (the assertion's XML signature is not checked). See
+> **Experimental.** Every SAML Response must be signed by the IdP: each XML
+> signature is verified against `idp-certificate-pem` (or the signing
+> certificate in `idp-metadata-xml`) with libxmlsec1 and exclusive c14n, and
+> only signed content is read. A response is accepted only if it answers an
+> AuthnRequest this agent issued in the last 10 minutes, is addressed to
+> `acs-url`, comes from `idp-entity-id`, names this SP as its audience, and
+> its assertion was not used before. Not supported: encrypted assertions,
+> IdP-initiated SSO, `idp-metadata-url` (it is not fetched), signed
+> AuthnRequests, and Single Logout. Outstanding AuthnRequests are kept in
+> memory, so the IdP's answer must reach the agent instance that sent the
+> user there. See
 > [zentinel-agent-auth#6](https://github.com/zentinelproxy/zentinel-agent-auth/issues/6).
-> What follows describes the intended design, not something you can turn on.
 
 This guide covers SAML 2.0 Single Sign-On (SSO) configuration for the Zentinel Auth Agent.
 
@@ -97,9 +105,9 @@ The agent acts as a SAML Service Provider (SP), supporting SP-initiated SSO with
 | **IdP Configuration** |
 | `idp-sso-url` | string | - | IdP SSO endpoint URL |
 | `idp-entity-id` | string | - | IdP entity ID |
-| `idp-metadata-url` | string | - | URL to fetch IdP metadata (alternative) |
-| `idp-metadata-xml` | string | - | Inline IdP metadata XML (alternative) |
-| `idp-certificate-pem` | string | - | IdP certificate for signature verification |
+| `idp-metadata-url` | string | - | Not fetched; does not provide the signing certificate |
+| `idp-metadata-xml` | string | - | Inline IdP metadata XML; its signing certificate verifies responses |
+| `idp-certificate-pem` | string | - | IdP signing certificate (PEM). This or `idp-metadata-xml` is *required* |
 | **SP Certificates** |
 | `private-key-pem` | string | - | SP private key for signing/decryption |
 | `certificate-pem` | string | - | SP certificate for metadata |
@@ -115,7 +123,7 @@ The agent acts as a SAML Service Provider (SP), supporting SP-initiated SSO with
 | `cookie-http-only` | bool | `true` | Prevent JavaScript access |
 | `cookie-same-site` | string | `Lax` | SameSite policy |
 | **Security Settings** |
-| `allow-unsigned-assertions` | bool | `false` | Allow unsigned assertions (NOT recommended) |
+| `allow-unsigned-assertions` | bool | `false` | Must stay `false`: `true` is rejected |
 | `clock-skew-secs` | int | `300` | Tolerance for clock differences (5 min) |
 | **Path Protection** |
 | `protected-paths` | array | `[]` | Paths to protect (empty = all) |
@@ -298,7 +306,6 @@ Set-Cookie: zentinel_saml_session=a1b2c3d4e5f6...; Path=/; Secure; HttpOnly; Sam
 
 - [ ] Use HTTPS for all endpoints (required by SAML spec)
 - [ ] Verify IdP certificate is configured
-- [ ] Set `allow-unsigned-assertions: false` (default)
 - [ ] Configure appropriate `session-ttl-secs`
 - [ ] Secure the session store file permissions
 - [ ] Review `protected-paths` and `excluded-paths`
