@@ -159,8 +159,8 @@ connection: once per pooled connection at startup and again on every
 reconnect. The agent must answer each one. Keys: `jwt-secret`,
 `jwt-algorithm`, `jwt-issuer`, `jwt-audience`, `api-keys`, `api-key-header`,
 `basic-auth-users`, `basic-auth-allow-plaintext`, `user-id-header`,
-`auth-method-header`, `fail-open`, and the `oidc`, `authz` and `scim` tables
-(`saml`, `mtls` and `token-exchange` exist but are refused when enabled, see
+`auth-method-header`, `fail-open`, and the `oidc`, `saml`, `authz` and `scim`
+tables (`mtls` and `token-exchange` exist but are refused when enabled, see
 [How it works](#how-it-works)). There is no key for `--jwt-public-key`.
 
 - A key the block sets replaces the flag of the same name; a key it leaves
@@ -169,8 +169,8 @@ reconnect. The agent must answer each one. Keys: `jwt-secret`,
   even when the agent was started with `--fail-open`.
 - `api-keys` and `basic-auth-users` are lists: give several arguments. A
   single argument arrives as a string, which the agent rejects.
-- A block that does not parse, fails validation (OIDC, Cedar policies, SCIM,
-  Basic auth users) or enables SAML, mTLS or token exchange is rejected
+- A block that does not parse, fails validation (OIDC, SAML, Cedar policies,
+  SCIM, Basic auth users) or enables mTLS or token exchange is rejected
   whole: `on_configure` returns false, nothing of it is applied, and the
   proxy does not use the agent (the connection fails with an ERROR log and is
   retried; meanwhile its filters' `failure-mode` applies, `closed` answering
@@ -208,20 +208,28 @@ Zentinel config. Treat them as experimental:
   with the verified claims, the roles claim, the auth method, method, path
   and hour. A policy that does not parse rejects the configuration; a policy
   that errors during evaluation denies the request.
+- SAML 2.0 SP-initiated SSO: every response must be signed by the IdP
+  certificate in `idp-certificate-pem` (or `idp-metadata-xml`), verified with
+  libxmlsec1 (exclusive c14n); only the signed content is read, and the
+  response must answer an AuthnRequest this agent issued, for `acs-url`, from
+  `idp-entity-id`, once. `RelayState` only redirects to a path on this site.
+  Details and limits in [`docs/saml.md`](docs/saml.md).
 - SCIM 2.0 user store (redb) that can block deactivated OIDC users. Its
   endpoint takes the static bearer token (compared in constant time) or an
   OIDC token carrying `required-scope` (default `scim`; cannot be empty).
 
-**Refused:** a configuration that enables SAML, mTLS or token exchange is
+**Refused:** a configuration that enables mTLS or token exchange is
 rejected whole (`on_configure` returns false, nothing of it is applied, and
 Zentinel 26.10_8 then does not use the agent: its routes follow their
 `failure-mode`), because these modules do not verify what they trust
 ([#6](https://github.com/zentinelproxy/zentinel-agent-auth/issues/6)):
 
-- SAML does not verify the assertion's XML signature, so a forged response
-  would get a session for any user.
 - mTLS reads a certificate from a request header and never verifies its chain
   against a CA, so a self-signed certificate would authenticate as any subject.
+  Verifying the chain would not be enough: a certificate is public, and
+  Zentinel neither sets nor strips that header, so anyone could send someone
+  else's valid certificate. It needs the certificate the proxy verified in the
+  TLS handshake, which the agent protocol does not carry yet.
 - Token exchange issues tokens with whatever scope and audience the caller
   asks for; `allowed-exchanges` and the scope mapping are not checked.
 

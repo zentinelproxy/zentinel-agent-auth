@@ -250,8 +250,6 @@ pub struct AuthConfigJson {
 ///
 /// Each is refused rather than run until its verification exists:
 ///
-/// - **SAML** accepts an assertion without checking its XML signature, so
-///   anyone can post a forged response and get a session for any NameID.
 /// - **mTLS** reads a certificate from a request header and never verifies
 ///   its chain against a trust anchor, so a self-signed certificate with any
 ///   subject authenticates as that subject.
@@ -271,7 +269,6 @@ pub const UNVERIFIED_MODULES_ISSUE: &str =
 /// [`UNVERIFIED_MODULES_ISSUE`].
 fn refuse_unverified_modules(config: &AuthConfigJson) -> Result<()> {
     let enabled: Vec<&str> = [
-        ("saml", config.saml.enabled),
         ("mtls", config.mtls.enabled),
         ("token-exchange", config.token_exchange.enabled),
     ]
@@ -285,11 +282,21 @@ fn refuse_unverified_modules(config: &AuthConfigJson) -> Result<()> {
     }
     Err(anyhow!(
         "refusing to enable {}: these modules do not verify what they trust \
-         (SAML signatures, mTLS certificate chains, token-exchange grants) and \
+         (mTLS certificate chains, token-exchange grants) and \
          are disabled until they do; see {}",
         enabled.join(", "),
         UNVERIFIED_MODULES_ISSUE
     ))
+}
+
+/// True for a RelayState that may be used as the post-login redirect: a path
+/// on this site. RelayState is not covered by the IdP's signature, so
+/// anything else would make the ACS an open redirect.
+fn is_local_redirect(target: &str) -> bool {
+    target.starts_with('/')
+        && !target.starts_with("//")
+        && !target.contains('\\')
+        && !target.chars().any(char::is_control)
 }
 
 /// The error for a module enabled by any path other than `on_configure`.
@@ -443,16 +450,17 @@ impl AuthAgent {
 
     /// Initialize or update SAML provider.
     pub fn configure_saml(&self, config: SamlConfig) -> Result<()> {
-        if config.enabled {
-            return Err(unverified_module_error("saml"));
-        }
-        if config.enabled {
-            let provider = SamlProvider::new(config.clone())?;
+        {
             let mut guard = self
                 .saml_provider
                 .write()
                 .map_err(|_| anyhow!("SAML provider lock poisoned"))?;
-            *guard = Some(provider);
+            match (guard.as_ref(), config.enabled) {
+                // Keep the provider (and the AuthnRequests it is waiting on).
+                (Some(provider), _) => provider.reconfigure(config.clone())?,
+                (None, true) => *guard = Some(SamlProvider::new(config.clone())?),
+                (None, false) => {}
+            }
         }
 
         let mut saml_cfg = self
@@ -1211,6 +1219,14 @@ impl AuthAgent {
             // Compiles the policies: a parse error rejects the configure.
             CedarAuthorizer::new(&authz_config)
                 .map_err(|e| anyhow!("Cedar authorization config rejected: {}", e))?;
+        }
+
+        let mut saml_config = self.get_saml_config().unwrap_or_default();
+        json_config.saml.apply_to(&mut saml_config);
+        if saml_config.enabled {
+            // Builds the verifier: no IdP signing certificate, or one that
+            // does not parse, rejects the configure.
+            SamlProvider::new(saml_config).map_err(|e| anyhow!("SAML config rejected: {}", e))?;
         }
 
         let mut scim_config = self.get_scim_config().unwrap_or_default();
@@ -2031,7 +2047,7 @@ impl AgentHandlerV2 for AuthAgent {
             }
         };
 
-        // Buffer the chunk (data is already a String)
+        // Buffer the chunk. The proxy sends the bytes base64-encoded.
         if let Ok(mut buffer) = self.body_buffer.write() {
             let key = if is_exchange {
                 exchange_key.clone()
@@ -2041,7 +2057,13 @@ impl AgentHandlerV2 for AuthAgent {
                 event.correlation_id.clone()
             };
             if let Some(body) = buffer.get_mut(&key) {
-                body.extend_from_slice(event.data.as_bytes());
+                match BASE64.decode(event.data.as_bytes()) {
+                    Ok(bytes) => body.extend_from_slice(&bytes),
+                    Err(_) => {
+                        buffer.remove(&key);
+                        return AgentResponse::block(400, Some("Invalid request body".to_string()));
+                    }
+                }
             }
         }
 
@@ -2199,7 +2221,9 @@ impl AgentHandlerV2 for AuthAgent {
             );
 
             // Build redirect response with session cookie
-            let redirect_url = relay_state.unwrap_or_else(|| "/".to_string());
+            let redirect_url = relay_state
+                .filter(|r| is_local_redirect(r))
+                .unwrap_or_else(|| "/".to_string());
             let cookie = saml_config.build_cookie(&session.id.to_hex());
 
             AgentResponse::block(302, None)
@@ -2569,7 +2593,6 @@ mod tests {
 
     fn refused_configs() -> Vec<(&'static str, serde_json::Value)> {
         vec![
-            ("saml", serde_json::json!({ "saml": { "enabled": true } })),
             ("mtls", serde_json::json!({ "mtls": { "enabled": true } })),
             (
                 "token-exchange",
@@ -2618,11 +2641,6 @@ mod tests {
     #[test]
     fn enabling_an_unverified_module_directly_is_refused() {
         let agent = AuthAgent::new(test_config(), None, None);
-        let saml = SamlConfig {
-            enabled: true,
-            ..SamlConfig::default()
-        };
-        assert!(agent.configure_saml(saml).is_err());
         let mtls = MtlsConfig {
             enabled: true,
             ..MtlsConfig::default()
@@ -3205,5 +3223,184 @@ mod tests {
         let ops = header_ops(&response);
         assert!(removed(&ops, "x-auth-claim-role"), "{ops:?}");
         assert!(removed(&ops, "x-user-id"), "{ops:?}");
+    }
+
+    /// What the IdP gets: the ID of the AuthnRequest in a redirect.
+    fn authn_request_id(location: &str) -> String {
+        use std::io::Read;
+        let query = location.split_once("SAMLRequest=").unwrap().1;
+        let encoded = urlencoding::decode(query.split('&').next().unwrap()).unwrap();
+        let deflated = BASE64.decode(encoded.as_bytes()).unwrap();
+        let mut xml = String::new();
+        flate2::read::DeflateDecoder::new(deflated.as_slice())
+            .read_to_string(&mut xml)
+            .unwrap();
+        let start = xml.find("ID=\"").unwrap() + 4;
+        xml[start..].split('"').next().unwrap().to_string()
+    }
+
+    fn response_header(response: &AgentResponse, header: &str) -> Option<String> {
+        response.response_headers.iter().find_map(|op| match op {
+            HeaderOp::Set { name, value } if name == header => Some(value.clone()),
+            _ => None,
+        })
+    }
+
+    async fn saml_agent(idp: &saml::test_support::Idp) -> (tempfile::TempDir, AuthAgent) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path().join("sessions.redb"), 3600).unwrap();
+        let agent = AuthAgent::new(test_config(), Some(Arc::new(store)), None);
+        let config = serde_json::json!({
+            "saml": {
+                "enabled": true,
+                "entity-id": saml::test_support::SP_ENTITY,
+                "acs-url": saml::test_support::ACS_URL,
+                "acs-path": "/saml/acs",
+                "idp-sso-url": "https://idp.example.com/sso",
+                "idp-entity-id": saml::test_support::IDP_ENTITY,
+                "idp-certificate-pem": idp.cert_pem(),
+            }
+        });
+        assert!(
+            agent.on_configure(config, None).await,
+            "SAML config refused"
+        );
+        (dir, agent)
+    }
+
+    /// Post `xml` to the ACS the way the proxy delivers it: headers, then the
+    /// form body base64-encoded in a body chunk.
+    async fn post_to_acs(agent: &AuthAgent, xml: &str, relay_state: &str) -> AgentResponse {
+        let headers = HashMap::from([(
+            "content-type".to_string(),
+            vec!["application/x-www-form-urlencoded".to_string()],
+        )]);
+        let first = agent
+            .on_request_headers(request_event("POST", "/saml/acs", headers))
+            .await;
+        assert!(first.needs_more, "ACS must wait for the body");
+        let form = format!(
+            "SAMLResponse={}&RelayState={}",
+            urlencoding::encode(&BASE64.encode(xml)),
+            urlencoding::encode(relay_state)
+        );
+        agent
+            .on_request_body_chunk(RequestBodyChunkEvent {
+                correlation_id: "test-correlation".to_string(),
+                data: BASE64.encode(form.as_bytes()),
+                is_last: true,
+                total_size: Some(form.len()),
+                chunk_index: 0,
+                bytes_received: form.len(),
+            })
+            .await
+    }
+
+    /// The SP-initiated flow end to end through the agent: a request is sent
+    /// to the IdP, the IdP's signed answer creates a session, and the
+    /// session cookie authenticates the next request.
+    #[tokio::test]
+    async fn saml_login_with_a_signed_response_creates_a_session() {
+        let idp = saml::test_support::Idp::new();
+        let (_dir, agent) = saml_agent(&idp).await;
+
+        let redirect = agent
+            .on_request_headers(request_event("GET", "/app", HashMap::new()))
+            .await;
+        let location = response_header(&redirect, "Location").expect("redirect to the IdP");
+        assert!(
+            location.starts_with("https://idp.example.com/sso?"),
+            "{location}"
+        );
+        let request_id = authn_request_id(&location);
+
+        let xml = idp.signed_xml("alice@example.com", &request_id);
+        let login = post_to_acs(&agent, &xml, "/app").await;
+        assert!(
+            matches!(login.decision, Decision::Block { status: 302, .. }),
+            "{:?}",
+            login.decision
+        );
+        assert_eq!(response_header(&login, "Location").as_deref(), Some("/app"));
+        let cookie = response_header(&login, "Set-Cookie").expect("session cookie");
+        let cookie = cookie.split(';').next().unwrap().to_string();
+
+        let headers = HashMap::from([("cookie".to_string(), vec![cookie])]);
+        let authed = agent
+            .on_request_headers(request_event("GET", "/app", headers))
+            .await;
+        assert!(
+            matches!(authed.decision, Decision::Allow),
+            "{:?}",
+            authed.decision
+        );
+        assert!(authed.request_headers.iter().any(|op| matches!(
+            op,
+            HeaderOp::Set { name, value } if name == "X-User-Id" && value == "alice@example.com"
+        )));
+    }
+
+    /// The bug in #6, through the agent: a forged (unsigned) response for
+    /// any user must not create a session.
+    #[tokio::test]
+    async fn saml_login_with_a_forged_response_is_refused() {
+        let idp = saml::test_support::Idp::new();
+        let (_dir, agent) = saml_agent(&idp).await;
+
+        let redirect = agent
+            .on_request_headers(request_event("GET", "/app", HashMap::new()))
+            .await;
+        let request_id = authn_request_id(&response_header(&redirect, "Location").unwrap());
+
+        let mut forged = idp.template("admin@example.com", &request_id);
+        forged.signature = None;
+        let xml = samael::traits::ToXml::to_string(&forged).unwrap();
+        let login = post_to_acs(&agent, &xml, "/app").await;
+        assert!(
+            matches!(login.decision, Decision::Block { status: 401, .. }),
+            "{:?}",
+            login.decision
+        );
+        assert!(response_header(&login, "Set-Cookie").is_none());
+    }
+
+    /// RelayState is not signed: it must not turn the ACS into an open
+    /// redirect.
+    #[tokio::test]
+    async fn saml_relay_state_only_redirects_on_this_site() {
+        let idp = saml::test_support::Idp::new();
+        let (_dir, agent) = saml_agent(&idp).await;
+
+        for target in ["https://evil.example", "//evil.example", "/\\evil.example"] {
+            let redirect = agent
+                .on_request_headers(request_event("GET", "/app", HashMap::new()))
+                .await;
+            let request_id = authn_request_id(&response_header(&redirect, "Location").unwrap());
+            let xml = idp.signed_xml("alice@example.com", &request_id);
+            let login = post_to_acs(&agent, &xml, target).await;
+            assert_eq!(
+                response_header(&login, "Location").as_deref(),
+                Some("/"),
+                "{target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_saml_configuration_without_an_idp_certificate_is_rejected() {
+        let agent = AuthAgent::new(test_config(), None, None);
+        let config = serde_json::json!({
+            "api-key-header": "X-Changed",
+            "saml": {
+                "enabled": true,
+                "entity-id": "https://sp.example.com",
+                "acs-url": "https://sp.example.com/saml/acs",
+                "idp-sso-url": "https://idp.example.com/sso",
+                "idp-entity-id": "https://idp.example.com",
+            }
+        });
+        assert!(!agent.on_configure(config, None).await);
+        assert!(!agent.get_saml_config().unwrap().enabled);
+        assert_eq!(agent.config.read().unwrap().api_key_header, "X-API-Key");
     }
 }

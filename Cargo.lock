@@ -4303,6 +4303,7 @@ dependencies = [
  "flate2",
  "hex",
  "jsonwebtoken",
+ "libxml",
  "rand 0.8.8",
  "redb",
  "reqwest",
