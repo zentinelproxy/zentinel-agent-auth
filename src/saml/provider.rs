@@ -315,6 +315,22 @@ impl SamlProvider {
             }
         }
 
+        // Web SSO profile: the assertion must be restricted to this SP. samael
+        // only checks the audience when an AudienceRestriction is present, so
+        // require one; each restriction must include this SP (they are ANDed).
+        let restrictions = assertion
+            .conditions
+            .as_ref()
+            .and_then(|c| c.audience_restrictions.as_deref())
+            .unwrap_or_default();
+        if restrictions.is_empty()
+            || !restrictions
+                .iter()
+                .all(|r| r.audience.contains(&config.entity_id))
+        {
+            bail!("SAML assertion is not restricted to this SP's audience");
+        }
+
         // Web SSO profile: a bearer confirmation for this ACS, answering one
         // of our requests, and still valid.
         let request_id = assertion
@@ -760,5 +776,90 @@ mod tests {
             &idp.signed_xml("alice@example.com", REQUEST_ID)
         )
         .is_err());
+    }
+
+    /// The Web SSO profile requires an AudienceRestriction naming the SP;
+    /// samael accepts an assertion without one.
+    #[test]
+    fn an_assertion_without_an_audience_restriction_is_rejected() {
+        let idp = Idp::new();
+        let provider = provider_for(&idp);
+        let (_dir, store) = store();
+
+        let missing = idp.signed_xml_with("alice@example.com", REQUEST_ID, |r| {
+            r.assertion.as_mut().unwrap().conditions = None;
+        });
+        let err = post(&provider, &store, &missing).unwrap_err().to_string();
+        assert!(err.contains("audience"), "{err}");
+
+        let other = idp.signed_xml_with("alice@example.com", REQUEST_ID, |r| {
+            let conditions = r.assertion.as_mut().unwrap().conditions.as_mut().unwrap();
+            let restrictions = conditions.audience_restrictions.as_mut().unwrap();
+            restrictions.push(samael::schema::AudienceRestriction {
+                audience: vec!["https://other-sp.example.com".to_string()],
+            });
+        });
+        let err = post(&provider, &store, &other).unwrap_err().to_string();
+        assert!(err.contains("audience"), "{err}");
+    }
+
+    /// Many IdPs sign only the assertion, not the response around it.
+    #[test]
+    fn a_response_with_only_the_assertion_signed_is_accepted() {
+        let idp = Idp::new();
+        let provider = provider_for(&idp);
+        let (_dir, store) = store();
+
+        let xml = idp.signed_assertion_xml("alice@example.com", REQUEST_ID);
+        let assertion = post(&provider, &store, &xml).expect("assertion-signed response");
+        assert_eq!(assertion.user_id, "alice@example.com");
+
+        // The unsigned response around it cannot change who is logged in.
+        let xml = idp.signed_assertion_xml("alice@example.com", "_req-second");
+        provider.remember_request("_req-second");
+        let tampered = xml.replace("alice@example.com", "admin@example.com");
+        assert!(post(&provider, &store, &tampered).is_err());
+    }
+
+    /// The response with a DOCTYPE carried in an encoding the `<!DOCTYPE`
+    /// text check cannot see: UTF-7 (declared) and UTF-16BE (detected from
+    /// the first bytes; ASCII in UTF-16BE is valid UTF-8 with NULs).
+    fn with_hidden_doctype(signed: &str) -> Vec<(&'static str, String)> {
+        let body = signed.split_once("?>").map_or(signed, |(_, b)| b);
+        let utf7 = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-7\"?>\
+             +ADw-!DOCTYPE r +AFs-+ADw-!ENTITY x 'y'+AD4-+AF0-+AD4-{}",
+            body.replace('+', "+-")
+        );
+        let plain = format!("<!DOCTYPE r [<!ENTITY x 'y'>]>{body}");
+        let utf16: String = plain
+            .chars()
+            .flat_map(|c| {
+                assert!(c.is_ascii());
+                ['\0', c]
+            })
+            .collect();
+        vec![("utf-7", utf7), ("utf-16be", utf16)]
+    }
+
+    /// The structural checks refuse a DTD; that must not depend on the
+    /// encoding the document is written in.
+    #[test]
+    fn a_doctype_in_another_encoding_is_rejected() {
+        let idp = Idp::new();
+        let provider = provider_for(&idp);
+        let (_dir, store) = store();
+
+        let signed = idp.signed_xml("alice@example.com", REQUEST_ID);
+        for (encoding, xml) in with_hidden_doctype(&signed) {
+            assert!(!xml.contains("<!DOCTYPE"), "{encoding}");
+            match post(&provider, &store, &xml) {
+                Ok(a) => panic!("{encoding}: response with a DTD accepted for {}", a.user_id),
+                Err(e) => assert!(
+                    e.to_string().contains("DTD") || e.to_string().contains("encoding"),
+                    "{encoding}: {e}"
+                ),
+            }
+        }
     }
 }

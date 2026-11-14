@@ -6,6 +6,7 @@ use samael::idp::{
     response_builder::build_response_template, CertificateParams, IdentityProvider, KeyType, Rsa,
 };
 use samael::schema::Response;
+use samael::signature::Signature;
 use samael::traits::ToXml;
 
 pub(crate) const SP_ENTITY: &str = "https://sp.example.com";
@@ -71,7 +72,33 @@ impl Idp {
 
     /// A response signed with exclusive c14n by libxmlsec1, as XML.
     pub(crate) fn signed_xml(&self, name_id: &str, request_id: &str) -> String {
-        let unsigned = self.template(name_id, request_id).to_string().unwrap();
+        self.signed_xml_with(name_id, request_id, |_| {})
+    }
+
+    /// As [`Self::signed_xml`], with the template changed by `edit` before
+    /// it is signed.
+    pub(crate) fn signed_xml_with(
+        &self,
+        name_id: &str,
+        request_id: &str,
+        edit: impl FnOnce(&mut Response),
+    ) -> String {
+        let mut response = self.template(name_id, request_id);
+        edit(&mut response);
+        self.sign(&response)
+    }
+
+    /// A response whose assertion is signed and the response is not.
+    pub(crate) fn signed_assertion_xml(&self, name_id: &str, request_id: &str) -> String {
+        self.signed_xml_with(name_id, request_id, |response| {
+            response.signature = None;
+            let assertion = response.assertion.as_mut().unwrap();
+            assertion.signature = Some(Signature::template(&assertion.id, &self.cert_der));
+        })
+    }
+
+    fn sign(&self, response: &Response) -> String {
+        let unsigned = response.to_string().unwrap();
         samael::crypto::sign_xml(unsigned, &self.idp.export_private_key_der().unwrap()).unwrap()
     }
 }

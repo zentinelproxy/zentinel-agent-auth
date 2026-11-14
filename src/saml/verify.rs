@@ -7,9 +7,11 @@
 //! one shape that verification is sound for, so the element that is verified
 //! is the element that is consumed:
 //!
-//! - no DOCTYPE, comments or processing instructions (entity tricks, and the
-//!   comment-truncation attack on `NameID`, where a comment is invisible to
-//!   the canonicalised signature but splits the text the SP reads);
+//! - UTF-8 only (in another encoding the DOCTYPE check cannot see the
+//!   DOCTYPE), and no DOCTYPE, comments or processing instructions (entity
+//!   tricks, and the comment-truncation attack on `NameID`, where a comment
+//!   is invisible to the canonicalised signature but splits the text the SP
+//!   reads);
 //! - the root is a single `samlp:Response`, carrying exactly one
 //!   `saml:Assertion`, as a direct child, and no `EncryptedAssertion`;
 //! - no ID value occurs twice (`ID` or `xml:id`), so a `#ref` cannot resolve
@@ -45,6 +47,11 @@ fn same(a: &Node, b: &Node) -> bool {
 /// Check that `xml` is a SAML Response of the shape described in the module
 /// documentation. Does not verify any signature.
 pub fn check_response_structure(xml: &str) -> Result<()> {
+    // Only UTF-8 is read: libxml2 would otherwise decode the bytes in the
+    // declared (UTF-7, ...) or detected (UTF-16, UCS-4) encoding, in which
+    // the text checks below cannot see a DOCTYPE.
+    check_utf8_only(xml)?;
+
     // SAML responses never carry a DTD; refuse before any parser sees one.
     if xml.contains("<!DOCTYPE") || xml.contains("<!ENTITY") {
         bail!("SAML response contains a DTD");
@@ -53,6 +60,15 @@ pub fn check_response_structure(xml: &str) -> Result<()> {
     let doc = Parser::default()
         .parse_string(xml)
         .map_err(|e| anyhow!("SAML response is not well-formed XML: {e:?}"))?;
+    // And whatever got past the text checks: no DTD in the parsed document.
+    // SAFETY: `doc` owns a valid xmlDoc for as long as it lives.
+    let has_dtd = unsafe {
+        let ptr = doc.doc_ptr();
+        !(*ptr).intSubset.is_null() || !(*ptr).extSubset.is_null()
+    };
+    if has_dtd {
+        bail!("SAML response contains a DTD");
+    }
     let root = doc
         .get_root_element()
         .ok_or_else(|| anyhow!("SAML response has no root element"))?;
@@ -145,5 +161,34 @@ pub fn check_response_structure(xml: &str) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Refuse input libxml2 would not read as UTF-8: NUL characters (an
+/// autodetected UTF-16/UCS-4 document is valid UTF-8 with NULs) and an XML
+/// declaration naming any other encoding.
+fn check_utf8_only(xml: &str) -> Result<()> {
+    if xml.contains('\0') {
+        bail!("SAML response contains a NUL character (only the UTF-8 encoding is accepted)");
+    }
+    let Some(rest) = xml.trim_start_matches('\u{feff}').strip_prefix("<?xml") else {
+        return Ok(());
+    };
+    let declaration = rest.split_once("?>").map_or(rest, |(d, _)| d);
+    let Some((_, after)) = declaration.split_once("encoding") else {
+        return Ok(());
+    };
+    let value = after
+        .trim_start()
+        .strip_prefix('=')
+        .map(str::trim_start)
+        .and_then(|v| {
+            let quote = v.chars().next().filter(|q| *q == '"' || *q == '\'')?;
+            v[1..].split_once(quote).map(|(value, _)| value)
+        })
+        .ok_or_else(|| anyhow!("SAML response has a malformed XML declaration"))?;
+    if !value.eq_ignore_ascii_case("UTF-8") {
+        bail!("SAML response declares the encoding {value:?}; only UTF-8 is accepted");
+    }
     Ok(())
 }
