@@ -26,7 +26,10 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, like the release build: on ubuntu-26.04 (libxml2 2.15)
+    # samael's generated libxml2/xmlsec bindings fail their layout checks and
+    # the crate does not compile.
+    runs-on: ubuntu-24.04
     steps:
       - name: Free disk space
         run: |
@@ -54,7 +57,10 @@ jobs:
 
   test:
     name: Tests
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, like the release build: on ubuntu-26.04 (libxml2 2.15)
+    # samael's generated libxml2/xmlsec bindings fail their layout checks and
+    # the crate does not compile.
+    runs-on: ubuntu-24.04
     steps:
       - name: Free disk space
         run: |
